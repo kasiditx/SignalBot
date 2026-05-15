@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import logging
 import os
@@ -29,6 +30,12 @@ def main() -> int:
 
     interval_seconds = _get_int_env("SIGNAL_POLL_SECONDS", 30, 5)
     state_path = Path(os.getenv("SIGNAL_STATE_PATH", "logs/signal_poller_state.json"))
+    lock_path = Path(os.getenv("SIGNAL_LOCK_PATH", "logs/signal_poller.lock"))
+    lock_file = _acquire_lock(lock_path)
+    if lock_file is None:
+        LOGGER.error("Signal poller is already running. Lock file: %s", lock_path)
+        return 1
+
     signal_config = load_signal_config()
     telegram_config = load_telegram_config()
     auto_trade_config = load_auto_trade_config()
@@ -150,6 +157,19 @@ def _get_bool_env(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _acquire_lock(path: Path) -> object | None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        return None
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    return lock_file
 
 
 if __name__ == "__main__":
