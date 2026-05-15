@@ -89,6 +89,7 @@ Pro MTF Price Action Structure
 - ถ้าเห็น momentum exhaustion แบบ large-medium-small จะไม่เข้า
 - ถ้าแท่งปิดชิดปลายทางมากเกินไปแบบ no continuation wick จะไม่ไล่ราคา
 - ใช้ EMA, RSI และ ATR เป็น confirmation/risk context ไม่ใช่ blind signal
+- ใช้ price-action edge จากคู่มือกราฟเปล่า เช่น clean traffic, wick fill, force flip/engulfing, rejection และ Fibonacci context ก่อนยอมรับ breakout
 - body breakout ขั้นต่ำตั้งค่าได้ผ่าน `SIGNAL_BODY_BREAK_ATR_RATIO` ค่า default ปัจจุบันคือ `0.20`
 - ใช้ `M5` เป็น execution timeframe แล้วกรองด้วย `D1/H4/H1/M30/M15` ก่อนปล่อยสัญญาณ
 - `30M` และ `15M` ต้องไปทางเดียวกับสัญญาณทั้งคู่ เพื่อลด breakout ที่ยังไม่มีแรงหนุนระยะกลาง
@@ -124,6 +125,7 @@ Pro MTF Price Action Structure
 - RSI อยู่สุดโต่งเกินไป
 - multi-timeframe filter ยังไม่ผ่าน เช่น `30M/15M` ไม่ไปทางเดียวกัน หรือ `1D/4H/1H` มี timeframe สวนทางกับสัญญาณ
 - risk/reward หรือ clean momentum ยังไม่ชัด
+- breakout/breakdown มีแต่ราคาไล่ แต่ไม่มี clean traffic, wick-fill target, force flip/rejection หรือ fib context รองรับ
 
 ## Risk Management
 

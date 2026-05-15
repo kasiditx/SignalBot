@@ -11,6 +11,7 @@ from .multitimeframe import (
 
 STRATEGY_NAME = "Pro MTF Price Action Structure"
 STRUCTURE_LOOKBACK = 20
+TRAFFIC_LOOKBACK = 40
 RECENT_MOMENTUM_CANDLES = 7
 DEFAULT_BODY_BREAK_ATR_RATIO = 0.20
 EXHAUSTION_BODY_RATIO = 0.45
@@ -74,6 +75,25 @@ def generate_signal(
     )
 
     if bullish_breakout and directional_buy_ok and buy_trend_allowed:
+        if not _has_price_action_edge(SignalAction.BUY, candles, latest.close, support, resistance, atr_now, config.risk_reward):
+            return _wait_signal(
+                config=config,
+                latest=latest,
+                support=support,
+                resistance=resistance,
+                fast_now=fast_now,
+                slow_now=slow_now,
+                rsi_now=rsi_now,
+                atr_now=atr_now,
+                market_structure=market_structure,
+                setup_type="Breakout without clean price-action edge",
+                trend_summary=trend_summary,
+                trend_alignment=trend_alignment,
+                wait_reason=(
+                    "M5 breakout แล้ว แต่ยังไม่เห็น clean traffic, force flip, wick-fill target, "
+                    "rejection หรือ fib context ที่ชัดพอ จึงรอเพื่อไม่ไล่ breakout เปล่า"
+                ),
+            )
         return _build_directional_signal(
             action=SignalAction.BUY,
             candles=candles,
@@ -90,6 +110,25 @@ def generate_signal(
             trend_alignment=trend_alignment,
         )
     if bearish_breakdown and directional_sell_ok and sell_trend_allowed:
+        if not _has_price_action_edge(SignalAction.SELL, candles, latest.close, support, resistance, atr_now, config.risk_reward):
+            return _wait_signal(
+                config=config,
+                latest=latest,
+                support=support,
+                resistance=resistance,
+                fast_now=fast_now,
+                slow_now=slow_now,
+                rsi_now=rsi_now,
+                atr_now=atr_now,
+                market_structure=market_structure,
+                setup_type="Breakdown without clean price-action edge",
+                trend_summary=trend_summary,
+                trend_alignment=trend_alignment,
+                wait_reason=(
+                    "M5 breakdown แล้ว แต่ยังไม่เห็น clean traffic, force flip, wick-fill target, "
+                    "rejection หรือ fib context ที่ชัดพอ จึงรอเพื่อไม่ไล่ breakdown เปล่า"
+                ),
+            )
         return _build_directional_signal(
             action=SignalAction.SELL,
             candles=candles,
@@ -111,6 +150,38 @@ def generate_signal(
             "ต้องให้ 30M และ 15M ไปทางเดียวกับสัญญาณทั้งคู่ และ 1D/4H/1H ต้องไม่มี timeframe ที่สวนทาง"
         )
 
+    return _wait_signal(
+        config=config,
+        latest=latest,
+        support=support,
+        resistance=resistance,
+        fast_now=fast_now,
+        slow_now=slow_now,
+        rsi_now=rsi_now,
+        atr_now=atr_now,
+        market_structure=market_structure,
+        setup_type=setup_type,
+        trend_summary=trend_summary,
+        trend_alignment=trend_alignment,
+        wait_reason=wait_reason,
+    )
+
+
+def _wait_signal(
+    config: SignalConfig,
+    latest: Candle,
+    support: float,
+    resistance: float,
+    fast_now: float,
+    slow_now: float,
+    rsi_now: float,
+    atr_now: float,
+    market_structure: str,
+    setup_type: str,
+    trend_summary: str,
+    trend_alignment: str,
+    wait_reason: str,
+) -> Signal:
     return Signal(
         action=SignalAction.WAIT,
         symbol=config.symbol,
@@ -160,16 +231,28 @@ def _build_directional_signal(
         stop_loss = min(latest.low, previous.low) - wick_buffer
         risk_distance = entry - stop_loss
         take_profit = entry + (risk_distance * effective_risk_reward)
-        entry_condition = "Buy เฉพาะหลังเนื้อเทียนปิดเหนือแนวต้านเดิม ยืนยันว่าเป็น MSB/Breakout ไม่ใช่แค่ wick sweep"
+        entry_condition = (
+            "Buy หลัง body close เหนือแนวต้าน พร้อม price-action edge เช่น clean traffic, "
+            "force flip, wick-fill target, rejection หรือ fib context"
+        )
         invalidation = "ยกเลิกแผน Buy หากราคาปิดกลับใต้แนวต้านที่ breakout หรือหลุดปลาย wick protection"
-        reason = "เกิด body-close breakout ตามคู่มือ: รอให้กำแพงแตกก่อน แล้วเก็บ residual momentum ในโซนที่มี clean traffic"
+        reason = (
+            "เกิด body-close breakout ตามคู่มือกราฟเปล่า: รอให้โครงสร้างยืนยันก่อน "
+            "แล้วเข้าเฉพาะเมื่อมีทางราคา/แรงเทียนสนับสนุน ไม่ใช่ blind breakout"
+        )
     else:
         stop_loss = max(latest.high, previous.high) + wick_buffer
         risk_distance = stop_loss - entry
         take_profit = entry - (risk_distance * effective_risk_reward)
-        entry_condition = "Sell เฉพาะหลังเนื้อเทียนปิดใต้แนวรับเดิม ยืนยันว่าเป็น MSB/Breakdown ไม่ใช่แค่ wick sweep"
+        entry_condition = (
+            "Sell หลัง body close ใต้แนวรับ พร้อม price-action edge เช่น clean traffic, "
+            "force flip, wick-fill target, rejection หรือ fib context"
+        )
         invalidation = "ยกเลิกแผน Sell หากราคาปิดกลับเหนือแนวรับที่ breakdown หรือชน wick protection"
-        reason = "เกิด body-close breakdown ตามคู่มือ: รอให้กำแพงแตกก่อน แล้วเก็บ residual momentum ในโซนที่มี clean traffic"
+        reason = (
+            "เกิด body-close breakdown ตามคู่มือกราฟเปล่า: รอให้โครงสร้างยืนยันก่อน "
+            "แล้วเข้าเฉพาะเมื่อมีทางราคา/แรงเทียนสนับสนุน ไม่ใช่ blind breakdown"
+        )
 
     confidence = _confidence(candles, fast_ema_value, slow_ema_value, atr_value, rsi_value)
 
@@ -205,6 +288,136 @@ def _build_directional_signal(
 
 def _support_resistance(candles: list[Candle], lookback: int = 20) -> tuple[float, float]:
     recent = candles[-(lookback + 1) : -1]
+    return min(candle.low for candle in recent), max(candle.high for candle in recent)
+
+
+def _has_price_action_edge(
+    action: SignalAction,
+    candles: list[Candle],
+    entry: float,
+    support: float,
+    resistance: float,
+    atr_value: float,
+    risk_reward: float,
+) -> bool:
+    latest = candles[-1]
+    previous = candles[-2]
+    risk_distance = _estimated_risk_distance(action, latest, previous, entry, atr_value)
+    target = entry + (risk_distance * risk_reward) if action == SignalAction.BUY else entry - (risk_distance * risk_reward)
+
+    confirmations = [
+        _has_clean_traffic(action, candles, entry, target, atr_value),
+        _is_force_flip(action, latest, previous),
+        _has_wick_fill_target(action, candles, entry, target),
+        _has_rejection(action, latest, support, resistance, atr_value),
+        _has_fib_context(action, candles, entry),
+    ]
+    return any(confirmations)
+
+
+def _estimated_risk_distance(
+    action: SignalAction,
+    latest: Candle,
+    previous: Candle,
+    entry: float,
+    atr_value: float,
+) -> float:
+    wick_buffer = atr_value * WICK_BUFFER_ATR_RATIO
+    if action == SignalAction.BUY:
+        stop_loss = min(latest.low, previous.low) - wick_buffer
+        return max(entry - stop_loss, atr_value * 0.1)
+    stop_loss = max(latest.high, previous.high) + wick_buffer
+    return max(stop_loss - entry, atr_value * 0.1)
+
+
+def _has_clean_traffic(
+    action: SignalAction,
+    candles: list[Candle],
+    entry: float,
+    target: float,
+    atr_value: float,
+) -> bool:
+    left_side = candles[-(TRAFFIC_LOOKBACK + 1) : -1]
+    lower = min(entry, target)
+    upper = max(entry, target)
+    if upper <= lower:
+        return False
+
+    noisy_touches = 0
+    tolerance = atr_value * 0.05
+    for candle in left_side:
+        overlaps_target_path = candle.high >= lower - tolerance and candle.low <= upper + tolerance
+        if overlaps_target_path:
+            noisy_touches += 1
+
+    if action == SignalAction.BUY:
+        made_road = any(candle.high >= target for candle in left_side)
+    else:
+        made_road = any(candle.low <= target for candle in left_side)
+    return made_road and noisy_touches <= max(6, len(left_side) // 5)
+
+
+def _is_force_flip(action: SignalAction, latest: Candle, previous: Candle) -> bool:
+    latest_body_high = max(latest.open, latest.close)
+    latest_body_low = min(latest.open, latest.close)
+    previous_body_high = max(previous.open, previous.close)
+    previous_body_low = min(previous.open, previous.close)
+    engulfs_previous_body = latest_body_high >= previous_body_high and latest_body_low <= previous_body_low
+
+    if action == SignalAction.BUY:
+        return latest.close > latest.open and previous.close < previous.open and engulfs_previous_body
+    return latest.close < latest.open and previous.close > previous.open and engulfs_previous_body
+
+
+def _has_wick_fill_target(action: SignalAction, candles: list[Candle], entry: float, target: float) -> bool:
+    left_side = candles[-(TRAFFIC_LOOKBACK + 1) : -1]
+    if action == SignalAction.BUY:
+        return any(candle.high >= target and candle.high > max(candle.open, candle.close) for candle in left_side)
+    return any(candle.low <= target and candle.low < min(candle.open, candle.close) for candle in left_side)
+
+
+def _has_rejection(
+    action: SignalAction,
+    latest: Candle,
+    support: float,
+    resistance: float,
+    atr_value: float,
+) -> bool:
+    body = max(abs(latest.close - latest.open), atr_value * 0.05)
+    upper_wick = latest.high - max(latest.open, latest.close)
+    lower_wick = min(latest.open, latest.close) - latest.low
+
+    if action == SignalAction.BUY:
+        near_support = latest.low <= support + (atr_value * 0.25)
+        return latest.close > latest.open and lower_wick >= body * 0.8 and (near_support or latest.close > resistance)
+
+    near_resistance = latest.high >= resistance - (atr_value * 0.25)
+    return latest.close < latest.open and upper_wick >= body * 0.8 and (near_resistance or latest.close < support)
+
+
+def _has_fib_context(action: SignalAction, candles: list[Candle], entry: float) -> bool:
+    swing = _recent_swing(candles)
+    if swing is None:
+        return False
+    swing_low, swing_high = swing
+    swing_range = swing_high - swing_low
+    if swing_range <= 0:
+        return False
+
+    fib_382 = swing_high - (swing_range * 0.382)
+    fib_618 = swing_high - (swing_range * 0.618)
+    if action == SignalAction.BUY:
+        return fib_618 <= entry <= swing_high
+
+    bearish_382 = swing_low + (swing_range * 0.382)
+    bearish_618 = swing_low + (swing_range * 0.618)
+    return swing_low <= entry <= bearish_618 or bearish_382 <= entry <= bearish_618
+
+
+def _recent_swing(candles: list[Candle], lookback: int = 40) -> tuple[float, float] | None:
+    recent = candles[-lookback:]
+    if len(recent) < 10:
+        return None
     return min(candle.low for candle in recent), max(candle.high for candle in recent)
 
 

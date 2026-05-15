@@ -18,6 +18,8 @@ RED: Color = (207, 73, 64)
 BLUE: Color = (56, 111, 214)
 ORANGE: Color = (232, 149, 58)
 PURPLE: Color = (113, 82, 179)
+YELLOW: Color = (209, 168, 41)
+TEAL: Color = (20, 150, 150)
 
 
 def render_signal_chart(
@@ -75,6 +77,8 @@ def render_signal_chart(
             body_bottom += 1
         _fill_rect(image, center_x - candle_width // 2, body_top, center_x + candle_width // 2, body_bottom, color)
 
+    _draw_trend_line(image, selected, low, high, plot_left, plot_right, plot_top, plot_bottom)
+    _draw_fibonacci_levels(image, selected, signal, low, high, plot_left, plot_right, plot_top, plot_bottom)
     _draw_level(image, signal.support, low, high, plot_left, plot_right, plot_top, plot_bottom, BLUE, "Support")
     _draw_level(image, signal.resistance, low, high, plot_left, plot_right, plot_top, plot_bottom, ORANGE, "Resistance")
     if signal.levels.stop_loss is not None:
@@ -93,6 +97,82 @@ def render_signal_chart(
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(_encode_png(image))
     return str(output)
+
+
+def _draw_trend_line(
+    image: list[list[Color]],
+    candles: list[Candle],
+    low: float,
+    high: float,
+    left: int,
+    right: int,
+    top: int,
+    bottom: int,
+) -> None:
+    if len(candles) < 12:
+        return
+
+    midpoint = len(candles) // 2
+    first_half = candles[:midpoint]
+    second_half = candles[midpoint:]
+    slot_width = (right - left) / len(candles)
+    bullish_context = candles[-1].close >= candles[0].close
+
+    if bullish_context:
+        first_index = min(range(len(first_half)), key=lambda index: first_half[index].low)
+        second_index = midpoint + min(range(len(second_half)), key=lambda index: second_half[index].low)
+        first_price = candles[first_index].low
+        second_price = candles[second_index].low
+        label = "Trend HL"
+    else:
+        first_index = max(range(len(first_half)), key=lambda index: first_half[index].high)
+        second_index = midpoint + max(range(len(second_half)), key=lambda index: second_half[index].high)
+        first_price = candles[first_index].high
+        second_price = candles[second_index].high
+        label = "Trend LH"
+
+    x1 = int(left + (first_index + 0.5) * slot_width)
+    x2 = int(left + (second_index + 0.5) * slot_width)
+    y1 = _price_to_y(first_price, low, high, top, bottom)
+    y2 = _price_to_y(second_price, low, high, top, bottom)
+    _draw_line(image, x1, y1, x2, y2, TEAL)
+    _draw_text(image, min(x1, x2), min(y1, y2) - 16, label, TEAL, scale=1)
+
+
+def _draw_fibonacci_levels(
+    image: list[list[Color]],
+    candles: list[Candle],
+    signal: Signal,
+    low: float,
+    high: float,
+    left: int,
+    right: int,
+    top: int,
+    bottom: int,
+) -> None:
+    swing_low = min(candle.low for candle in candles)
+    swing_high = max(candle.high for candle in candles)
+    swing_range = swing_high - swing_low
+    if swing_range <= 0:
+        return
+
+    if signal.action == SignalAction.SELL:
+        levels = (
+            ("FIB 38.2", swing_low + swing_range * 0.382),
+            ("FIB 50.0", swing_low + swing_range * 0.5),
+            ("FIB 61.8", swing_low + swing_range * 0.618),
+        )
+    else:
+        levels = (
+            ("FIB 38.2", swing_high - swing_range * 0.382),
+            ("FIB 50.0", swing_high - swing_range * 0.5),
+            ("FIB 61.8", swing_high - swing_range * 0.618),
+        )
+
+    for label, price in levels:
+        y = _price_to_y(price, low, high, top, bottom)
+        _draw_dashed_line(image, left, y, right, y, YELLOW)
+        _draw_text(image, left + 8, y - 12, f"{label} {_format_price(price)}", YELLOW, scale=1)
 
 
 def _draw_level(
@@ -146,6 +226,16 @@ def _draw_line(image: list[list[Color]], x1: int, y1: int, x2: int, y2: int, col
         if doubled <= dx:
             error += dx
             y += sy
+
+
+def _draw_dashed_line(image: list[list[Color]], x1: int, y1: int, x2: int, y2: int, color: Color) -> None:
+    dash_length = 8
+    gap_length = 6
+    current = x1
+    while current < x2:
+        end = min(current + dash_length, x2)
+        _draw_line(image, current, y1, end, y2, color)
+        current = end + gap_length
 
 
 def _fill_rect(image: list[list[Color]], x1: int, y1: int, x2: int, y2: int, color: Color) -> None:
