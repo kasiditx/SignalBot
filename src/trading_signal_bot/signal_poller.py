@@ -24,11 +24,17 @@ from .time_utils import parse_candle_timestamp
 LOGGER = logging.getLogger(__name__)
 
 
+class StaleCandleError(ValueError):
+    """Raised when the latest exported market candle is too old to trade safely."""
+
+
 def main() -> int:
     load_env_file()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     interval_seconds = _get_int_env("SIGNAL_POLL_SECONDS", 30, 5)
+    stale_log_seconds = _get_int_env("SIGNAL_STALE_LOG_SECONDS", 300, 30)
+    error_log_seconds = _get_int_env("SIGNAL_ERROR_LOG_SECONDS", 60, 5)
     state_path = Path(os.getenv("SIGNAL_STATE_PATH", "logs/signal_poller_state.json"))
     lock_path = Path(os.getenv("SIGNAL_LOCK_PATH", "logs/signal_poller.lock"))
     lock_file = _acquire_lock(lock_path)
@@ -42,6 +48,7 @@ def main() -> int:
 
     LOGGER.info("Signal poller started. CSV=%s interval=%ss", signal_config.csv_path, interval_seconds)
     last_fingerprint = _read_last_fingerprint(state_path)
+    last_log_at: dict[str, float] = {}
 
     while True:
         try:
@@ -86,10 +93,19 @@ def main() -> int:
         except KeyboardInterrupt:
             LOGGER.info("Signal poller stopped")
             return 0
+        except StaleCandleError as exc:
+            if _should_log(last_log_at, "stale_candle", stale_log_seconds):
+                LOGGER.warning(
+                    "%s Trading paused until MT5 exports a fresh M5 candle. "
+                    "Check MT5 is open, connected, and TradingSignalCsvExporter is attached to the correct symbol.",
+                    exc,
+                )
         except FileNotFoundError as exc:
-            LOGGER.warning("%s. Waiting for MT5 exporter to create the CSV.", exc)
+            if _should_log(last_log_at, "missing_csv", error_log_seconds):
+                LOGGER.warning("%s. Waiting for MT5 exporter to create the CSV.", exc)
         except Exception as exc:
-            LOGGER.error("Polling failed: %s", exc)
+            if _should_log(last_log_at, f"polling_error:{type(exc).__name__}", error_log_seconds):
+                LOGGER.error("Polling failed: %s", exc)
 
         try:
             time.sleep(interval_seconds)
@@ -118,13 +134,22 @@ def _write_last_fingerprint(path: Path, fingerprint: str) -> None:
     path.write_text(json.dumps({"fingerprint": fingerprint}, ensure_ascii=False), encoding="utf-8")
 
 
+def _should_log(last_log_at: dict[str, float], key: str, throttle_seconds: int) -> bool:
+    now = time.monotonic()
+    previous = last_log_at.get(key)
+    if previous is not None and now - previous < throttle_seconds:
+        return False
+    last_log_at[key] = now
+    return True
+
+
 def _validate_latest_candle_age(timestamp: str, max_age_minutes: int) -> None:
     latest = parse_candle_timestamp(timestamp)
     age_minutes = (datetime.now(tz=UTC) - latest).total_seconds() / 60
     if age_minutes < 0:
         age_minutes = 0
     if age_minutes > max_age_minutes:
-        raise ValueError(
+        raise StaleCandleError(
             f"Latest candle is stale: {timestamp}. "
             f"Max allowed age is {max_age_minutes} minutes. Check MT5 symbol/timeframe/history."
         )
