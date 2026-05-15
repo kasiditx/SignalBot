@@ -27,6 +27,13 @@ LOGGER = logging.getLogger(__name__)
 class StaleCandleError(ValueError):
     """Raised when the latest exported market candle is too old to trade safely."""
 
+    def __init__(self, timestamp: str, max_age_minutes: int) -> None:
+        self.timestamp = timestamp
+        super().__init__(
+            f"Latest candle is stale: {timestamp}. "
+            f"Max allowed age is {max_age_minutes} minutes. Check MT5 symbol/timeframe/history."
+        )
+
 
 def main() -> int:
     load_env_file()
@@ -36,6 +43,7 @@ def main() -> int:
     stale_log_seconds = _get_int_env("SIGNAL_STALE_LOG_SECONDS", 300, 30)
     error_log_seconds = _get_int_env("SIGNAL_ERROR_LOG_SECONDS", 60, 5)
     state_path = Path(os.getenv("SIGNAL_STATE_PATH", "logs/signal_poller_state.json"))
+    log_state_path = Path(os.getenv("SIGNAL_LOG_STATE_PATH", "logs/signal_poller_log_state.json"))
     lock_path = Path(os.getenv("SIGNAL_LOCK_PATH", "logs/signal_poller.lock"))
     lock_file = _acquire_lock(lock_path)
     if lock_file is None:
@@ -48,7 +56,7 @@ def main() -> int:
 
     LOGGER.info("Signal poller started. CSV=%s interval=%ss", signal_config.csv_path, interval_seconds)
     last_fingerprint = _read_last_fingerprint(state_path)
-    last_log_at: dict[str, float] = {}
+    last_log_at = _read_log_state(log_state_path)
 
     while True:
         try:
@@ -94,17 +102,17 @@ def main() -> int:
             LOGGER.info("Signal poller stopped")
             return 0
         except StaleCandleError as exc:
-            if _should_log(last_log_at, "stale_candle", stale_log_seconds):
+            if _should_log(last_log_at, log_state_path, f"stale_candle:{exc.timestamp}", stale_log_seconds):
                 LOGGER.warning(
                     "%s Trading paused until MT5 exports a fresh M5 candle. "
                     "Check MT5 is open, connected, and TradingSignalCsvExporter is attached to the correct symbol.",
                     exc,
                 )
         except FileNotFoundError as exc:
-            if _should_log(last_log_at, "missing_csv", error_log_seconds):
+            if _should_log(last_log_at, log_state_path, "missing_csv", error_log_seconds):
                 LOGGER.warning("%s. Waiting for MT5 exporter to create the CSV.", exc)
         except Exception as exc:
-            if _should_log(last_log_at, f"polling_error:{type(exc).__name__}", error_log_seconds):
+            if _should_log(last_log_at, log_state_path, f"polling_error:{type(exc).__name__}", error_log_seconds):
                 LOGGER.error("Polling failed: %s", exc)
 
         try:
@@ -134,12 +142,30 @@ def _write_last_fingerprint(path: Path, fingerprint: str) -> None:
     path.write_text(json.dumps({"fingerprint": fingerprint}, ensure_ascii=False), encoding="utf-8")
 
 
-def _should_log(last_log_at: dict[str, float], key: str, throttle_seconds: int) -> bool:
-    now = time.monotonic()
+def _read_log_state(path: Path) -> dict[str, float]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(key): float(value) for key, value in data.items() if isinstance(value, int | float)}
+
+
+def _write_log_state(path: Path, last_log_at: dict[str, float]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(last_log_at, ensure_ascii=False), encoding="utf-8")
+
+
+def _should_log(last_log_at: dict[str, float], state_path: Path, key: str, throttle_seconds: int) -> bool:
+    now = time.time()
     previous = last_log_at.get(key)
     if previous is not None and now - previous < throttle_seconds:
         return False
     last_log_at[key] = now
+    _write_log_state(state_path, last_log_at)
     return True
 
 
@@ -149,10 +175,7 @@ def _validate_latest_candle_age(timestamp: str, max_age_minutes: int) -> None:
     if age_minutes < 0:
         age_minutes = 0
     if age_minutes > max_age_minutes:
-        raise StaleCandleError(
-            f"Latest candle is stale: {timestamp}. "
-            f"Max allowed age is {max_age_minutes} minutes. Check MT5 symbol/timeframe/history."
-        )
+        raise StaleCandleError(timestamp, max_age_minutes)
 
 
 def _validate_all_candle_ages(candles_by_timeframe: dict[str, list[Candle]], max_age_minutes: int) -> None:
