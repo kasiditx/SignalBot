@@ -58,6 +58,8 @@ def generate_signal(
     setup_type, wait_reason = _setup_context(candles, support, resistance, atr_now, body_break_atr_ratio)
     bullish_breakout = setup_type == "Bullish body-close breakout"
     bearish_breakdown = setup_type == "Bearish body-close breakdown"
+    bullish_pullback = _is_trend_pullback_entry(SignalAction.BUY, candles, fast_now, slow_now, support, resistance, atr_now, rsi_now)
+    bearish_pullback = _is_trend_pullback_entry(SignalAction.SELL, candles, fast_now, slow_now, support, resistance, atr_now, rsi_now)
     directional_buy_ok = fast_now >= slow_now or latest.close > slow_now
     directional_sell_ok = fast_now <= slow_now or latest.close < slow_now
 
@@ -106,6 +108,38 @@ def generate_signal(
             atr_value=atr_now,
             market_structure=market_structure,
             setup_type=setup_type,
+            trend_summary=trend_summary,
+            trend_alignment=trend_alignment,
+        )
+    if bullish_pullback and directional_buy_ok and buy_trend_allowed:
+        return _build_directional_signal(
+            action=SignalAction.BUY,
+            candles=candles,
+            config=config,
+            support=support,
+            resistance=resistance,
+            fast_ema_value=fast_now,
+            slow_ema_value=slow_now,
+            rsi_value=rsi_now,
+            atr_value=atr_now,
+            market_structure=market_structure,
+            setup_type="Bullish pullback rejection continuation",
+            trend_summary=trend_summary,
+            trend_alignment=trend_alignment,
+        )
+    if bearish_pullback and directional_sell_ok and sell_trend_allowed:
+        return _build_directional_signal(
+            action=SignalAction.SELL,
+            candles=candles,
+            config=config,
+            support=support,
+            resistance=resistance,
+            fast_ema_value=fast_now,
+            slow_ema_value=slow_now,
+            rsi_value=rsi_now,
+            atr_value=atr_now,
+            market_structure=market_structure,
+            setup_type="Bearish pullback rejection continuation",
             trend_summary=trend_summary,
             trend_alignment=trend_alignment,
         )
@@ -313,6 +347,41 @@ def _has_price_action_edge(
         _has_fib_context(action, candles, entry),
     ]
     return any(confirmations)
+
+
+def _is_trend_pullback_entry(
+    action: SignalAction,
+    candles: list[Candle],
+    fast_ema_value: float,
+    slow_ema_value: float,
+    support: float,
+    resistance: float,
+    atr_value: float,
+    rsi_value: float,
+) -> bool:
+    latest = candles[-1]
+    previous = candles[-2]
+    recent = candles[-6:]
+    body = max(abs(latest.close - latest.open), atr_value * 0.05)
+    lower_wick = min(latest.open, latest.close) - latest.low
+    upper_wick = latest.high - max(latest.open, latest.close)
+    near_fast_ema = abs(latest.close - fast_ema_value) <= atr_value * 0.85
+
+    if _is_exhaustion(candles) and not _is_force_flip(action, latest, previous):
+        return False
+
+    if action == SignalAction.BUY:
+        has_recent_pullback = min(candle.low for candle in recent[:-1]) <= fast_ema_value + (atr_value * 0.35)
+        bullish_rejection = latest.close > latest.open and lower_wick >= body * 0.45
+        bullish_continuation = latest.close > previous.high or _is_force_flip(action, latest, previous)
+        not_overextended = rsi_value <= 68 and latest.close <= resistance + (atr_value * 0.35)
+        return near_fast_ema and has_recent_pullback and bullish_rejection and bullish_continuation and not_overextended
+
+    has_recent_pullback = max(candle.high for candle in recent[:-1]) >= fast_ema_value - (atr_value * 0.35)
+    bearish_rejection = latest.close < latest.open and upper_wick >= body * 0.45
+    bearish_continuation = latest.close < previous.low or _is_force_flip(action, latest, previous)
+    not_overextended = rsi_value >= 28 and latest.close >= support - (atr_value * 0.35)
+    return near_fast_ema and has_recent_pullback and bearish_rejection and bearish_continuation and not_overextended
 
 
 def _estimated_risk_distance(
