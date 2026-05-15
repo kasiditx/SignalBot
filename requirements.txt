@@ -1,0 +1,4 @@
+# Core runtime uses only the Python standard library.
+#
+# Optional, MT5-capable environments only:
+# MetaTrader5
