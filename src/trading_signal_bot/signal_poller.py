@@ -35,6 +35,16 @@ class StaleCandleError(ValueError):
         )
 
 
+class MarketClosedStaleError(ValueError):
+    """Raised when stale candles are expected because the market is closed."""
+
+    def __init__(self, timestamp: str) -> None:
+        self.timestamp = timestamp
+        super().__init__(
+            f"Latest M5 candle is {timestamp}, which is expected while the Forex/CFD market is closed."
+        )
+
+
 def main() -> int:
     load_env_file()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -42,6 +52,8 @@ def main() -> int:
     interval_seconds = _get_int_env("SIGNAL_POLL_SECONDS", 30, 5)
     stale_log_seconds = _get_int_env("SIGNAL_STALE_LOG_SECONDS", 300, 30)
     error_log_seconds = _get_int_env("SIGNAL_ERROR_LOG_SECONDS", 60, 5)
+    allow_market_closed_stale = _get_bool_env("SIGNAL_ALLOW_MARKET_CLOSED_STALE", True)
+    market_closed_stale_hours = _get_int_env("SIGNAL_MARKET_CLOSED_STALE_HOURS", 72, 24)
     state_path = Path(os.getenv("SIGNAL_STATE_PATH", "logs/signal_poller_state.json"))
     log_state_path = Path(os.getenv("SIGNAL_LOG_STATE_PATH", "logs/signal_poller_log_state.json"))
     lock_path = Path(os.getenv("SIGNAL_LOCK_PATH", "logs/signal_poller.lock"))
@@ -62,7 +74,12 @@ def main() -> int:
         try:
             candles_by_timeframe = load_timeframe_candles(signal_config)
             candles = execution_candles(candles_by_timeframe, signal_config)
-            _validate_all_candle_ages(candles_by_timeframe, signal_config.max_candle_age_minutes)
+            _validate_all_candle_ages(
+                candles_by_timeframe,
+                signal_config.max_candle_age_minutes,
+                allow_market_closed_stale,
+                market_closed_stale_hours,
+            )
             signal = generate_signal(candles, signal_config, candles_by_timeframe)
             message = format_signal_message(signal)
             fingerprint = _fingerprint(message)
@@ -108,6 +125,9 @@ def main() -> int:
                     "Check MT5 is open, connected, and TradingSignalCsvExporter is attached to the correct symbol.",
                     exc,
                 )
+        except MarketClosedStaleError as exc:
+            if _should_log(last_log_at, log_state_path, f"market_closed:{exc.timestamp}", stale_log_seconds):
+                LOGGER.info("%s Trading paused until the market opens and MT5 receives a fresh candle.", exc)
         except FileNotFoundError as exc:
             if _should_log(last_log_at, log_state_path, "missing_csv", error_log_seconds):
                 LOGGER.warning("%s. Waiting for MT5 exporter to create the CSV.", exc)
@@ -169,22 +189,57 @@ def _should_log(last_log_at: dict[str, float], state_path: Path, key: str, throt
     return True
 
 
-def _validate_latest_candle_age(timestamp: str, max_age_minutes: int) -> None:
+def _validate_latest_candle_age(
+    timestamp: str,
+    max_age_minutes: int,
+    allow_market_closed_stale: bool,
+    market_closed_stale_hours: int,
+) -> None:
     latest = parse_candle_timestamp(timestamp)
-    age_minutes = (datetime.now(tz=UTC) - latest).total_seconds() / 60
+    now = datetime.now(tz=UTC)
+    age_minutes = (now - latest).total_seconds() / 60
     if age_minutes < 0:
         age_minutes = 0
     if age_minutes > max_age_minutes:
+        if allow_market_closed_stale and _is_expected_market_closed_stale(latest, now, market_closed_stale_hours):
+            raise MarketClosedStaleError(timestamp)
         raise StaleCandleError(timestamp, max_age_minutes)
 
 
-def _validate_all_candle_ages(candles_by_timeframe: dict[str, list[Candle]], max_age_minutes: int) -> None:
+def _validate_all_candle_ages(
+    candles_by_timeframe: dict[str, list[Candle]],
+    max_age_minutes: int,
+    allow_market_closed_stale: bool,
+    market_closed_stale_hours: int,
+) -> None:
     for timeframe, candles in candles_by_timeframe.items():
         if not candles:
             raise ValueError(f"No candles for timeframe {timeframe}")
         if timeframe != "M5":
             continue
-        _validate_latest_candle_age(candles[-1].timestamp, max_age_minutes)
+        _validate_latest_candle_age(
+            candles[-1].timestamp,
+            max_age_minutes,
+            allow_market_closed_stale,
+            market_closed_stale_hours,
+        )
+
+
+def _is_expected_market_closed_stale(latest: datetime, now: datetime, max_stale_hours: int) -> bool:
+    age_hours = (now - latest).total_seconds() / 3600
+    if age_hours < 0 or age_hours > max_stale_hours:
+        return False
+
+    friday = 4
+    saturday = 5
+    sunday = 6
+    monday = 0
+
+    if latest.weekday() != friday:
+        return False
+    if now.weekday() in {saturday, sunday}:
+        return True
+    return now.weekday() == monday and now.hour < 2
 
 
 def _get_int_env(name: str, default: int, minimum: int) -> int:
