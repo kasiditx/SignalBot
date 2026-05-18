@@ -77,6 +77,25 @@ def generate_signal(
     )
 
     if bullish_breakout and directional_buy_ok and buy_trend_allowed:
+        if not _high_winrate_setup_allows(SignalAction.BUY, setup_type, config.multi_timeframe_enabled):
+            return _wait_signal(
+                config=config,
+                latest=latest,
+                support=support,
+                resistance=resistance,
+                fast_now=fast_now,
+                slow_now=slow_now,
+                rsi_now=rsi_now,
+                atr_now=atr_now,
+                market_structure=market_structure,
+                setup_type="High-win-rate filter rejected bullish breakout",
+                trend_summary=trend_summary,
+                trend_alignment=trend_alignment,
+                wait_reason=(
+                    "โหมดคัดสัญญาณคุณภาพสูงไม่เข้า Buy breakout ทันที เพราะ backtest ล่าสุดให้ win rate ต่ำ "
+                    "จึงรอ Buy เฉพาะ pullback/rejection continuation ที่มีโครงสร้างรองรับ"
+                ),
+            )
         if not _has_price_action_edge(SignalAction.BUY, candles, latest.close, support, resistance, atr_now, config.risk_reward):
             return _wait_signal(
                 config=config,
@@ -603,6 +622,7 @@ def _trend_allows(
             htf_bias == TrendDirection.BULLISH
             and confirmation == TrendDirection.BULLISH
             and _timeframes_are_aligned(action, trends, CONFIRMATION_TIMEFRAMES)
+            and _execution_timeframe_is_aligned(action, trends)
             and not _has_opposite_higher_timeframe(action, trends)
         )
     if action == SignalAction.SELL:
@@ -610,6 +630,7 @@ def _trend_allows(
             htf_bias == TrendDirection.BEARISH
             and confirmation == TrendDirection.BEARISH
             and _timeframes_are_aligned(action, trends, CONFIRMATION_TIMEFRAMES)
+            and _execution_timeframe_is_aligned(action, trends)
             and not _has_opposite_higher_timeframe(action, trends)
         )
     return False
@@ -627,6 +648,17 @@ def _timeframes_are_aligned(
 def _has_opposite_higher_timeframe(action: SignalAction, trends: dict[str, TrendDirection]) -> bool:
     opposite = TrendDirection.BEARISH if action == SignalAction.BUY else TrendDirection.BULLISH
     return any(trends.get(timeframe) == opposite for timeframe in HIGHER_TIMEFRAMES)
+
+
+def _execution_timeframe_is_aligned(action: SignalAction, trends: dict[str, TrendDirection]) -> bool:
+    expected = TrendDirection.BULLISH if action == SignalAction.BUY else TrendDirection.BEARISH
+    return trends.get("M5") == expected
+
+
+def _high_winrate_setup_allows(action: SignalAction, setup_type: str, multi_timeframe_enabled: bool) -> bool:
+    if not multi_timeframe_enabled:
+        return True
+    return not (action == SignalAction.BUY and setup_type == "Bullish body-close breakout")
 
 
 def _trend_alignment_text(htf_bias: TrendDirection, confirmation: TrendDirection) -> str:
