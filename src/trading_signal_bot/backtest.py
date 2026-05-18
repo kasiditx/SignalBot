@@ -420,7 +420,7 @@ def _print_money_report(trades: list[BacktestTrade], money_config: BacktestMoney
     print(f"- Max money drawdown: ${max_drawdown:.2f} ({max_drawdown_percent:.2f}%)")
     print(f"- Risk per trade setting: {money_config.risk_percent:.2f}%")
     print(f"- Max actual risk per trade: ${max_risk_amount:.2f} ({max_risk_percent:.2f}% of initial balance)")
-    print(f"- Average volume: {average_volume:.2f} lot")
+    print(f"- Average volume: {average_volume:.3f} lot")
 
 
 def _get_optional_int_env(name: str, minimum: int) -> int | None:

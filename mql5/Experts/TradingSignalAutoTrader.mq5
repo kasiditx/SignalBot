@@ -220,7 +220,23 @@ double NormalizeVolume(const double requested_volume)
    if(step <= 0)
       return 0.0;
 
-   double clamped = MathMax(min_volume, MathMin(requested_volume, max_volume));
+   if(requested_volume < min_volume)
+   {
+      Print("Requested volume is below broker minimum. Requested=", requested_volume, " Min=", min_volume);
+      return 0.0;
+   }
+   if(requested_volume > max_volume)
+   {
+      Print("Requested volume is above broker maximum. Requested=", requested_volume, " Max=", max_volume);
+      return 0.0;
+   }
+
+   double clamped = MathMin(requested_volume, max_volume);
    double normalized = MathFloor(clamped / step) * step;
-   return NormalizeDouble(normalized, 2);
+   if(normalized < min_volume)
+   {
+      Print("Normalized volume is below broker minimum. Normalized=", normalized, " Min=", min_volume);
+      return 0.0;
+   }
+   return NormalizeDouble(normalized, 3);
 }
