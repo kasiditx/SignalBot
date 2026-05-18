@@ -50,6 +50,7 @@ class SignalConfig:
     timeframe_paths: dict[str, str]
     dry_run: bool
     send_wait: bool
+    trade_mode: str = "high_winrate"
 
 
 @dataclass(frozen=True)

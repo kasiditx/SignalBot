@@ -68,16 +68,18 @@ def generate_signal(
         htf_bias,
         confirmation,
         trends,
+        config.trade_mode,
     )
     sell_trend_allowed = not config.multi_timeframe_enabled or _trend_allows(
         SignalAction.SELL,
         htf_bias,
         confirmation,
         trends,
+        config.trade_mode,
     )
 
     if bullish_breakout and directional_buy_ok and buy_trend_allowed:
-        if not _high_winrate_setup_allows(SignalAction.BUY, setup_type, config.multi_timeframe_enabled):
+        if not _trade_mode_allows_setup(SignalAction.BUY, setup_type, config.trade_mode, config.multi_timeframe_enabled):
             return _wait_signal(
                 config=config,
                 latest=latest,
@@ -616,13 +618,14 @@ def _trend_allows(
     htf_bias: TrendDirection,
     confirmation: TrendDirection,
     trends: dict[str, TrendDirection],
+    trade_mode: str,
 ) -> bool:
     if action == SignalAction.BUY:
         return (
             htf_bias == TrendDirection.BULLISH
             and confirmation == TrendDirection.BULLISH
             and _timeframes_are_aligned(action, trends, CONFIRMATION_TIMEFRAMES)
-            and _execution_timeframe_is_aligned(action, trends)
+            and _trade_mode_allows_execution_timeframe(action, trends, trade_mode)
             and not _has_opposite_higher_timeframe(action, trends)
         )
     if action == SignalAction.SELL:
@@ -630,7 +633,7 @@ def _trend_allows(
             htf_bias == TrendDirection.BEARISH
             and confirmation == TrendDirection.BEARISH
             and _timeframes_are_aligned(action, trends, CONFIRMATION_TIMEFRAMES)
-            and _execution_timeframe_is_aligned(action, trends)
+            and _trade_mode_allows_execution_timeframe(action, trends, trade_mode)
             and not _has_opposite_higher_timeframe(action, trends)
         )
     return False
@@ -655,8 +658,25 @@ def _execution_timeframe_is_aligned(action: SignalAction, trends: dict[str, Tren
     return trends.get("M5") == expected
 
 
-def _high_winrate_setup_allows(action: SignalAction, setup_type: str, multi_timeframe_enabled: bool) -> bool:
+def _trade_mode_allows_execution_timeframe(
+    action: SignalAction,
+    trends: dict[str, TrendDirection],
+    trade_mode: str,
+) -> bool:
+    if trade_mode == "active":
+        return True
+    return _execution_timeframe_is_aligned(action, trends)
+
+
+def _trade_mode_allows_setup(
+    action: SignalAction,
+    setup_type: str,
+    trade_mode: str,
+    multi_timeframe_enabled: bool,
+) -> bool:
     if not multi_timeframe_enabled:
+        return True
+    if trade_mode == "active":
         return True
     return not (action == SignalAction.BUY and setup_type == "Bullish body-close breakout")
 

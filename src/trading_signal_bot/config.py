@@ -68,6 +68,9 @@ def load_signal_config() -> SignalConfig:
         "M15": os.getenv("SIGNAL_CSV_PATH_M15", "").strip(),
         "M5": os.getenv("SIGNAL_CSV_PATH_M5", "").strip(),
     }
+    trade_mode = os.getenv("SIGNAL_TRADE_MODE", "high_winrate").strip().lower() or "high_winrate"
+    if trade_mode not in {"high_winrate", "active"}:
+        raise ValueError("SIGNAL_TRADE_MODE must be high_winrate or active")
 
     return SignalConfig(
         symbol=os.getenv("SIGNAL_SYMBOL", "XAUUSD").strip() or "XAUUSD",
@@ -86,6 +89,7 @@ def load_signal_config() -> SignalConfig:
         timeframe_paths=timeframe_paths,
         dry_run=_get_bool("SIGNAL_DRY_RUN", True),
         send_wait=_get_bool("SIGNAL_SEND_WAIT", False),
+        trade_mode=trade_mode,
     )
 
 
