@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
-from trading_signal_bot.data import load_candles_from_csv
+from trading_signal_bot.data import _file_changed_while_reading, _file_was_recently_modified, load_candles_from_csv
 
 
 class DataLoaderTest(unittest.TestCase):
@@ -19,6 +21,17 @@ class DataLoaderTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "CSV read failed after retries"):
                 load_candles_from_csv(str(csv_path))
+
+    def test_detects_csv_that_changed_during_read(self) -> None:
+        before = SimpleNamespace(st_size=100, st_mtime_ns=10)
+        after = SimpleNamespace(st_size=120, st_mtime_ns=11)
+
+        self.assertTrue(_file_changed_while_reading(before, after))
+
+    def test_detects_recently_modified_csv_as_transient(self) -> None:
+        recent = SimpleNamespace(st_mtime=time.time())
+
+        self.assertTrue(_file_was_recently_modified(recent))
 
 
 if __name__ == "__main__":

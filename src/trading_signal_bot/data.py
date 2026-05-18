@@ -8,8 +8,13 @@ from .models import Candle
 
 
 REQUIRED_COLUMNS = {"timestamp", "open", "high", "low", "close", "volume"}
-CSV_READ_RETRIES = 3
-CSV_READ_RETRY_SECONDS = 0.2
+CSV_READ_RETRIES = 6
+CSV_READ_RETRY_SECONDS = 0.25
+CSV_STABLE_SECONDS = 0.75
+
+
+class TransientCsvReadError(ValueError):
+    """Raised when MT5 is probably still writing the CSV file."""
 
 
 def load_candles_from_csv(path: str) -> list[Candle]:
@@ -31,6 +36,7 @@ def load_candles_from_csv(path: str) -> list[Candle]:
 
 
 def _load_candles_from_path(csv_path: Path) -> list[Candle]:
+    stat_before = csv_path.stat()
     with csv_path.open("r", encoding="utf-8", newline="") as file:
         reader = csv.DictReader(file)
         if reader.fieldnames is None:
@@ -44,7 +50,22 @@ def _load_candles_from_path(csv_path: Path) -> list[Candle]:
 
     if not candles:
         raise ValueError("CSV does not contain candle rows")
+
+    stat_after = csv_path.stat()
+    if _file_changed_while_reading(stat_before, stat_after) or _file_was_recently_modified(stat_after):
+        raise TransientCsvReadError("CSV file is still being written by MT5")
     return candles
+
+
+def _file_changed_while_reading(stat_before: object, stat_after: object) -> bool:
+    return (
+        getattr(stat_before, "st_size") != getattr(stat_after, "st_size")
+        or getattr(stat_before, "st_mtime_ns") != getattr(stat_after, "st_mtime_ns")
+    )
+
+
+def _file_was_recently_modified(stat_result: object) -> bool:
+    return time.time() - float(getattr(stat_result, "st_mtime")) < CSV_STABLE_SECONDS
 
 
 def _parse_row(row: dict[str, str | None], line_number: int) -> Candle:
