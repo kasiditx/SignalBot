@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import csv
+import json
 import logging
+import math
 import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from collections.abc import Iterable
 from pathlib import Path
 
 from .config import load_env_file, load_signal_config
-from .models import Candle, SignalAction
+from .models import Candle, SignalAction, SignalConfig
 from .multitimeframe import EXECUTION_TIMEFRAME, load_timeframe_candles
 from .strategy import generate_signal
 from .time_utils import parse_candle_timestamp
@@ -54,6 +57,112 @@ class BacktestRunResult:
     trades: list[BacktestTrade]
     skipped_signals: int
     stopped_reason: str | None
+
+
+@dataclass(frozen=True)
+class BacktestDecision:
+    timestamp: str
+    session: str
+    symbol: str
+    timeframe: str
+    action: str | None
+    stage: str
+    approved: bool
+    reasons: tuple[str, ...]
+    htf_bias: str | None
+    execution_trend: str | None
+    price_location: str | None
+    candle_confirmation_summary: str | None
+    risk_reward: float | None
+
+
+@dataclass(frozen=True)
+class BacktestTradeResult:
+    action: SignalAction
+    session: str
+    entry_time: str
+    exit_time: str
+    entry: float
+    stop_loss: float
+    tp1: float | None
+    tp2: float | None
+    result: str
+    r_multiple: float
+    risk_reward: float | None
+    volume: float | None
+    pnl: float | None
+    balance_after: float | None
+    loss_reason: str | None
+    reject_reasons_before_entry: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class BacktestMetrics:
+    total_trades: int
+    approved_trades: int
+    rejected_trades: int
+    skipped_trades: int
+    win_rate: float
+    loss_rate: float
+    profit_factor: float
+    max_drawdown: float
+    average_win: float
+    average_loss: float
+    average_rr: float
+    max_consecutive_losses: int
+    net_r: float
+
+
+@dataclass(frozen=True)
+class BacktestReport:
+    trades: tuple[BacktestTradeResult, ...]
+    decisions: tuple[BacktestDecision, ...]
+    metrics: BacktestMetrics
+    session_metrics: dict[str, BacktestMetrics]
+    reject_reason_summary: dict[str, int]
+    skip_reason_summary: dict[str, int]
+    stopped_reason: str | None
+
+
+@dataclass(frozen=True)
+class BacktestCandidate:
+    decision: BacktestDecision
+    action: SignalAction
+    entry: float
+    stop_loss: float
+    tp1: float | None
+    tp2: float | None
+    risk_reward: float | None
+    signal_index: int
+
+
+@dataclass(frozen=True)
+class BacktestRealismConfig:
+    initial_balance: float
+    risk_percent: float
+    contract_size: float
+    min_volume: float
+    max_volume: float
+    volume_step: float
+    allow_min_volume: bool
+    spread_points: float
+    point_value: float
+    slippage_points: float
+    commission_per_lot: float
+    max_daily_loss_percent: float
+    max_consecutive_losses: int
+    cooldown_minutes: int
+
+
+@dataclass(frozen=True)
+class BacktestDailyRiskState:
+    date: str
+    trades_today: int
+    losses_today: int
+    consecutive_losses: int
+    realized_loss_percent: float
+    cooldown_until: datetime | None
+    stopped_for_day: bool
 
 
 @dataclass
@@ -163,6 +272,780 @@ def run_backtest_with_stats(
         index = _index_after_time(execution, trade.exit_time, index + 1)
 
     return BacktestRunResult(trades=trades, skipped_signals=skipped_signals, stopped_reason=stopped_reason)
+
+
+def execution_timeframe_for_backtest(config: object) -> str:
+    return getattr(config, "execution_timeframe", EXECUTION_TIMEFRAME)
+
+
+def has_required_snapshot_candles(
+    snapshot: dict[str, list[Candle]],
+    config: object,
+) -> bool:
+    execution_timeframe = execution_timeframe_for_backtest(config)
+    required_candles = getattr(config, "min_candles", 60)
+    return len(snapshot.get(execution_timeframe, [])) >= required_candles
+
+
+def backtest_decision_from_signal(
+    signal: object,
+    config: SignalConfig,
+    current_time: datetime,
+    stage: str,
+    approved: bool,
+    reasons: tuple[str, ...],
+) -> BacktestDecision:
+    execution_timeframe = execution_timeframe_for_backtest(config)
+    action = getattr(signal, "action", None)
+    levels = getattr(signal, "levels", None)
+    return BacktestDecision(
+        timestamp=current_time.isoformat(),
+        session=classify_session(current_time),
+        symbol=getattr(signal, "symbol", config.symbol),
+        timeframe=execution_timeframe,
+        action=action.value if isinstance(action, SignalAction) else None,
+        stage=stage,
+        approved=approved,
+        reasons=reasons,
+        htf_bias=_signal_text_attr(signal, "trend_alignment"),
+        execution_trend=_signal_text_attr(signal, "trend_summary"),
+        price_location=_signal_text_attr(signal, "setup_type"),
+        candle_confirmation_summary=_signal_text_attr(signal, "reason"),
+        risk_reward=getattr(levels, "risk_reward", None) if levels is not None else None,
+    )
+
+
+def backtest_candidate_from_signal(
+    signal: object,
+    decision: BacktestDecision,
+    signal_index: int,
+) -> BacktestCandidate:
+    action = getattr(signal, "action", None)
+    if action not in {SignalAction.BUY, SignalAction.SELL}:
+        raise ValueError("Backtest candidate requires BUY or SELL signal action")
+
+    levels = getattr(signal, "levels", None)
+    if levels is None:
+        raise ValueError("Signal levels are required to build a backtest candidate")
+    if levels.entry is None:
+        raise ValueError("Signal entry is required to build a backtest candidate")
+    if levels.stop_loss is None:
+        raise ValueError("Signal stop loss is required to build a backtest candidate")
+    if levels.take_profit is None:
+        raise ValueError("Signal take profit is required to build a backtest candidate")
+
+    return BacktestCandidate(
+        decision=decision,
+        action=action,
+        entry=float(levels.entry),
+        stop_loss=float(levels.stop_loss),
+        tp1=None,
+        tp2=float(levels.take_profit),
+        risk_reward=getattr(levels, "risk_reward", None) or decision.risk_reward,
+        signal_index=signal_index,
+    )
+
+
+def simulate_enhanced_trade(
+    candidate: BacktestCandidate,
+    execution_candles: list[Candle],
+) -> BacktestTradeResult:
+    if not execution_candles:
+        raise ValueError("Execution candles are required to simulate enhanced trade")
+
+    target = candidate.tp2 if candidate.tp2 is not None else candidate.tp1
+    if target is None:
+        raise ValueError("Take profit target is required to simulate enhanced trade")
+
+    risk_distance = abs(candidate.entry - candidate.stop_loss)
+    if risk_distance <= 0:
+        raise ValueError("Risk distance must be greater than zero")
+
+    entry_candle = execution_candles[min(candidate.signal_index, len(execution_candles) - 1)]
+    for candle in execution_candles[candidate.signal_index + 1 :]:
+        stopped, target_hit = _enhanced_exit_hits(candidate, candle, target)
+        if stopped and target_hit:
+            return _enhanced_trade_result(
+                candidate=candidate,
+                entry_time=entry_candle.timestamp,
+                exit_time=candle.timestamp,
+                target=target,
+                result="LOSS_BOTH_HIT",
+                r_multiple=-1.0,
+                loss_reason="both_tp_sl_hit",
+            )
+        if stopped:
+            return _enhanced_trade_result(
+                candidate=candidate,
+                entry_time=entry_candle.timestamp,
+                exit_time=candle.timestamp,
+                target=target,
+                result="LOSS",
+                r_multiple=-1.0,
+                loss_reason="stop_loss_hit",
+            )
+        if target_hit:
+            return _enhanced_trade_result(
+                candidate=candidate,
+                entry_time=entry_candle.timestamp,
+                exit_time=candle.timestamp,
+                target=target,
+                result="WIN",
+                r_multiple=abs(target - candidate.entry) / risk_distance,
+                loss_reason=None,
+            )
+
+    last = execution_candles[-1]
+    if candidate.action == SignalAction.BUY:
+        r_multiple = (last.close - candidate.entry) / risk_distance
+    else:
+        r_multiple = (candidate.entry - last.close) / risk_distance
+    return _enhanced_trade_result(
+        candidate=candidate,
+        entry_time=entry_candle.timestamp,
+        exit_time=last.timestamp,
+        target=target,
+        result="OPEN_AT_END",
+        r_multiple=r_multiple,
+        loss_reason="open_at_end",
+    )
+
+
+def calculate_backtest_position_size(
+    balance: float,
+    entry: float,
+    stop_loss: float,
+    realism: BacktestRealismConfig,
+) -> float:
+    if balance <= 0:
+        raise ValueError("Balance must be greater than zero")
+    if realism.risk_percent <= 0:
+        raise ValueError("Risk percent must be greater than zero")
+    if realism.contract_size <= 0:
+        raise ValueError("Contract size must be greater than zero")
+    if realism.min_volume <= 0:
+        raise ValueError("Minimum volume must be greater than zero")
+    if realism.max_volume <= 0:
+        raise ValueError("Maximum volume must be greater than zero")
+    if realism.volume_step <= 0:
+        raise ValueError("Volume step must be greater than zero")
+    if realism.min_volume > realism.max_volume:
+        raise ValueError("Minimum volume must be lower than or equal to maximum volume")
+
+    risk_distance = abs(entry - stop_loss)
+    if risk_distance <= 0:
+        raise ValueError("Risk distance must be greater than zero")
+
+    money_at_risk = balance * (realism.risk_percent / 100.0)
+    raw_volume = money_at_risk / (risk_distance * realism.contract_size)
+    step_count = math.floor((raw_volume / realism.volume_step) + 1e-12)
+    stepped_volume = step_count * realism.volume_step
+
+    if stepped_volume < realism.min_volume:
+        if not realism.allow_min_volume:
+            raise ValueError("Calculated volume is below minimum volume")
+        volume = realism.min_volume
+    else:
+        volume = stepped_volume
+
+    return round(min(volume, realism.max_volume), 8)
+
+
+def calculate_backtest_trade_costs(
+    volume: float,
+    realism: BacktestRealismConfig,
+) -> dict[str, float]:
+    if volume <= 0:
+        raise ValueError("Volume must be greater than zero")
+    if realism.contract_size <= 0:
+        raise ValueError("Contract size must be greater than zero")
+    if realism.point_value <= 0:
+        raise ValueError("Point value must be greater than zero")
+    if realism.spread_points < 0:
+        raise ValueError("Spread points must be greater than or equal to zero")
+    if realism.slippage_points < 0:
+        raise ValueError("Slippage points must be greater than or equal to zero")
+    if realism.commission_per_lot < 0:
+        raise ValueError("Commission per lot must be greater than or equal to zero")
+
+    commission = realism.commission_per_lot * volume
+    spread_cost = realism.spread_points * realism.point_value * realism.contract_size * volume
+    slippage_cost = realism.slippage_points * realism.point_value * realism.contract_size * volume
+    total_cost = commission + spread_cost + slippage_cost
+    return {
+        "commission": commission,
+        "spread_cost": spread_cost,
+        "slippage_cost": slippage_cost,
+        "total_cost": total_cost,
+    }
+
+
+def apply_backtest_money_result(
+    trade: BacktestTradeResult,
+    balance: float,
+    realism: BacktestRealismConfig,
+) -> BacktestTradeResult:
+    if balance <= 0:
+        raise ValueError("Balance must be greater than zero")
+
+    volume = calculate_backtest_position_size(
+        balance=balance,
+        entry=trade.entry,
+        stop_loss=trade.stop_loss,
+        realism=realism,
+    )
+    costs = calculate_backtest_trade_costs(volume, realism)
+    risk_distance = abs(trade.entry - trade.stop_loss)
+    if risk_distance <= 0:
+        raise ValueError("Risk distance must be greater than zero")
+
+    risk_amount = risk_distance * realism.contract_size * volume
+    gross_pnl = trade.r_multiple * risk_amount
+    net_pnl = gross_pnl - costs["total_cost"]
+    balance_after = balance + net_pnl
+    return BacktestTradeResult(
+        action=trade.action,
+        session=trade.session,
+        entry_time=trade.entry_time,
+        exit_time=trade.exit_time,
+        entry=trade.entry,
+        stop_loss=trade.stop_loss,
+        tp1=trade.tp1,
+        tp2=trade.tp2,
+        result=trade.result,
+        r_multiple=trade.r_multiple,
+        risk_reward=trade.risk_reward,
+        volume=volume,
+        pnl=net_pnl,
+        balance_after=balance_after,
+        loss_reason=trade.loss_reason,
+        reject_reasons_before_entry=trade.reject_reasons_before_entry,
+    )
+
+
+def capture_backtest_decision(
+    snapshot: dict[str, list[Candle]],
+    config: SignalConfig,
+    current_time: datetime,
+    money_config: BacktestMoneyConfig | None = None,
+    balance: float = 0.0,
+) -> BacktestDecision:
+    del money_config, balance
+    execution_timeframe = execution_timeframe_for_backtest(config)
+    if execution_timeframe not in snapshot:
+        return _backtest_decision_without_signal(
+            config=config,
+            current_time=current_time,
+            stage="market_data",
+            approved=False,
+            reasons=("missing execution timeframe candles",),
+        )
+    if not has_required_snapshot_candles(snapshot, config):
+        return _backtest_decision_without_signal(
+            config=config,
+            current_time=current_time,
+            stage="insufficient_candles",
+            approved=False,
+            reasons=("insufficient candles",),
+        )
+
+    try:
+        signal = generate_signal(snapshot[execution_timeframe], config, snapshot)
+    except ValueError as exc:
+        return _backtest_decision_without_signal(
+            config=config,
+            current_time=current_time,
+            stage="signal_error",
+            approved=False,
+            reasons=(str(exc),),
+        )
+
+    if signal.action == SignalAction.WAIT:
+        reason = getattr(signal, "no_trade_reason", None) or "signal action is WAIT"
+        return backtest_decision_from_signal(
+            signal=signal,
+            config=config,
+            current_time=current_time,
+            stage="skip",
+            approved=False,
+            reasons=(reason,),
+        )
+    if not _has_complete_trade_levels(signal):
+        return backtest_decision_from_signal(
+            signal=signal,
+            config=config,
+            current_time=current_time,
+            stage="skip",
+            approved=False,
+            reasons=("missing trade levels",),
+        )
+    return backtest_decision_from_signal(
+        signal=signal,
+        config=config,
+        current_time=current_time,
+        stage="signal_candidate",
+        approved=True,
+        reasons=(),
+    )
+
+
+def run_backtest_decision_capture(
+    candles_by_timeframe: dict[str, list[Candle]],
+    config: SignalConfig,
+    backtest_range: BacktestRange | None = None,
+    money_config: BacktestMoneyConfig | None = None,
+) -> tuple[BacktestDecision, ...]:
+    execution_timeframe = execution_timeframe_for_backtest(config)
+    execution = candles_by_timeframe.get(execution_timeframe)
+    if not execution:
+        return (
+            _backtest_decision_without_signal(
+                config=config,
+                current_time=datetime.now(),
+                stage="market_data",
+                approved=False,
+                reasons=("missing execution timeframe candles",),
+            ),
+        )
+
+    execution_timestamps = [parse_candle_timestamp(candle.timestamp) for candle in execution]
+    cursors = _build_cursors(candles_by_timeframe)
+    decisions: list[BacktestDecision] = []
+    index = max(0, getattr(config, "min_candles", 60) - 1)
+    snapshot_max_bars = max(getattr(config, "min_candles", 60) + 40, 160)
+    balance = money_config.initial_balance if money_config else 0.0
+
+    while index < len(execution):
+        current_time = execution_timestamps[index]
+        if backtest_range and not _is_in_backtest_range(current_time, backtest_range):
+            index += 1
+            continue
+        snapshot = _snapshot(cursors, current_time, snapshot_max_bars)
+        decisions.append(
+            capture_backtest_decision(
+                snapshot=snapshot,
+                config=config,
+                current_time=current_time,
+                money_config=money_config,
+                balance=balance,
+            )
+        )
+        index += 1
+    return tuple(decisions)
+
+
+def build_backtest_report_from_decisions(
+    decisions: tuple[BacktestDecision, ...],
+    trades: tuple[BacktestTradeResult, ...] = (),
+    stopped_reason: str | None = None,
+) -> BacktestReport:
+    trade_list = list(trades)
+    decision_list = list(decisions)
+    return BacktestReport(
+        trades=trades,
+        decisions=decisions,
+        metrics=calculate_backtest_metrics(trade_list, decision_list),
+        session_metrics=calculate_session_metrics(trade_list, decision_list),
+        reject_reason_summary=summarize_reject_reasons(decision_list),
+        skip_reason_summary=summarize_skip_reasons(decision_list),
+        stopped_reason=stopped_reason,
+    )
+
+
+def run_enhanced_backtest_report(
+    candles_by_timeframe: dict[str, list[Candle]],
+    config: SignalConfig,
+    backtest_range: BacktestRange | None = None,
+    money_config: BacktestMoneyConfig | None = None,
+) -> BacktestReport:
+    decisions = run_backtest_decision_capture(
+        candles_by_timeframe=candles_by_timeframe,
+        config=config,
+        backtest_range=backtest_range,
+        money_config=money_config,
+    )
+    return build_backtest_report_from_decisions(decisions)
+
+
+def capture_backtest_decision_and_candidate(
+    snapshot: dict[str, list[Candle]],
+    config: SignalConfig,
+    current_time: datetime,
+    signal_index: int,
+) -> tuple[BacktestDecision, BacktestCandidate | None]:
+    execution_timeframe = execution_timeframe_for_backtest(config)
+    if execution_timeframe not in snapshot:
+        return (
+            _backtest_decision_without_signal(
+                config=config,
+                current_time=current_time,
+                stage="market_data",
+                approved=False,
+                reasons=("missing execution timeframe candles",),
+            ),
+            None,
+        )
+    if not has_required_snapshot_candles(snapshot, config):
+        return (
+            _backtest_decision_without_signal(
+                config=config,
+                current_time=current_time,
+                stage="insufficient_candles",
+                approved=False,
+                reasons=("insufficient candles",),
+            ),
+            None,
+        )
+
+    try:
+        signal = generate_signal(snapshot[execution_timeframe], config, snapshot)
+    except ValueError as exc:
+        return (
+            _backtest_decision_without_signal(
+                config=config,
+                current_time=current_time,
+                stage="signal_error",
+                approved=False,
+                reasons=(str(exc),),
+            ),
+            None,
+        )
+
+    if signal.action == SignalAction.WAIT:
+        reason = getattr(signal, "no_trade_reason", None) or "signal action is WAIT"
+        return (
+            backtest_decision_from_signal(
+                signal=signal,
+                config=config,
+                current_time=current_time,
+                stage="skip",
+                approved=False,
+                reasons=(reason,),
+            ),
+            None,
+        )
+    if signal.action not in {SignalAction.BUY, SignalAction.SELL}:
+        return (
+            backtest_decision_from_signal(
+                signal=signal,
+                config=config,
+                current_time=current_time,
+                stage="skip",
+                approved=False,
+                reasons=("unsupported signal action",),
+            ),
+            None,
+        )
+    if not _has_complete_trade_levels(signal):
+        return (
+            backtest_decision_from_signal(
+                signal=signal,
+                config=config,
+                current_time=current_time,
+                stage="skip",
+                approved=False,
+                reasons=("missing trade levels",),
+            ),
+            None,
+        )
+
+    decision = backtest_decision_from_signal(
+        signal=signal,
+        config=config,
+        current_time=current_time,
+        stage="signal_candidate",
+        approved=True,
+        reasons=(),
+    )
+    return decision, backtest_candidate_from_signal(signal, decision, signal_index)
+
+
+def run_enhanced_backtest_report_with_simulation(
+    candles_by_timeframe: dict[str, list[Candle]],
+    config: SignalConfig,
+    backtest_range: BacktestRange | None = None,
+    money_config: BacktestMoneyConfig | None = None,
+) -> BacktestReport:
+    del money_config
+    execution_timeframe = execution_timeframe_for_backtest(config)
+    execution = candles_by_timeframe.get(execution_timeframe)
+    if not execution:
+        return build_backtest_report_from_decisions(
+            (
+                _backtest_decision_without_signal(
+                    config=config,
+                    current_time=datetime.now(),
+                    stage="market_data",
+                    approved=False,
+                    reasons=("missing execution timeframe candles",),
+                ),
+            )
+        )
+
+    execution_timestamps = [parse_candle_timestamp(candle.timestamp) for candle in execution]
+    cursors = _build_cursors(candles_by_timeframe)
+    decisions: list[BacktestDecision] = []
+    trades: list[BacktestTradeResult] = []
+    index = max(0, getattr(config, "min_candles", 60) - 1)
+    snapshot_max_bars = max(getattr(config, "min_candles", 60) + 40, 160)
+
+    while index < len(execution):
+        current_time = execution_timestamps[index]
+        if backtest_range and not _is_in_backtest_range(current_time, backtest_range):
+            index += 1
+            continue
+
+        snapshot = _snapshot(cursors, current_time, snapshot_max_bars)
+        decision, candidate = capture_backtest_decision_and_candidate(
+            snapshot=snapshot,
+            config=config,
+            current_time=current_time,
+            signal_index=index,
+        )
+        decisions.append(decision)
+
+        if candidate is None:
+            index += 1
+            continue
+
+        try:
+            trade = simulate_enhanced_trade(candidate, execution)
+        except ValueError as exc:
+            decisions.append(
+                _backtest_decision_without_signal(
+                    config=config,
+                    current_time=current_time,
+                    stage="simulation_error",
+                    approved=False,
+                    reasons=(str(exc),),
+                )
+            )
+            index += 1
+            continue
+
+        trades.append(trade)
+        index = _index_after_time(execution, trade.exit_time, index + 1)
+
+    return build_backtest_report_from_decisions(tuple(decisions), tuple(trades))
+
+
+def classify_session(timestamp: datetime) -> str:
+    hour = timestamp.hour
+    if 0 <= hour < 7:
+        return "Asia"
+    if 7 <= hour < 13:
+        return "London"
+    if 13 <= hour < 21:
+        return "NewYork"
+    return "Other"
+
+
+def calculate_backtest_metrics(
+    trades: list[BacktestTradeResult],
+    decisions: list[BacktestDecision],
+) -> BacktestMetrics:
+    wins = [trade for trade in trades if trade.result == "WIN"]
+    losses = [trade for trade in trades if trade.result.startswith("LOSS")]
+    closed = wins + losses
+    gross_win = sum(max(0.0, trade.r_multiple) for trade in wins)
+    gross_loss = abs(sum(min(0.0, trade.r_multiple) for trade in losses))
+    net_r = sum(trade.r_multiple for trade in trades)
+    average_win = _average([trade.r_multiple for trade in wins])
+    average_loss = _average([trade.r_multiple for trade in losses])
+    average_rr = _average([trade.risk_reward for trade in trades if trade.risk_reward is not None])
+
+    return BacktestMetrics(
+        total_trades=len(trades),
+        approved_trades=sum(1 for decision in decisions if decision.approved),
+        rejected_trades=sum(1 for decision in decisions if _is_reject_decision(decision)),
+        skipped_trades=sum(1 for decision in decisions if _is_skip_decision(decision)),
+        win_rate=(len(wins) / len(closed) * 100.0) if closed else 0.0,
+        loss_rate=(len(losses) / len(closed) * 100.0) if closed else 0.0,
+        profit_factor=_profit_factor(gross_win, gross_loss),
+        max_drawdown=_max_enhanced_drawdown(trades),
+        average_win=average_win,
+        average_loss=average_loss,
+        average_rr=average_rr,
+        max_consecutive_losses=_max_consecutive_losses(trades),
+        net_r=net_r,
+    )
+
+
+def summarize_reject_reasons(
+    decisions: list[BacktestDecision],
+) -> dict[str, int]:
+    return _summarize_decision_reasons(decision for decision in decisions if _is_reject_decision(decision))
+
+
+def summarize_skip_reasons(
+    decisions: list[BacktestDecision],
+) -> dict[str, int]:
+    return _summarize_decision_reasons(decision for decision in decisions if _is_skip_decision(decision))
+
+
+def calculate_session_metrics(
+    trades: list[BacktestTradeResult],
+    decisions: list[BacktestDecision],
+) -> dict[str, BacktestMetrics]:
+    sessions = ("Asia", "London", "NewYork", "Other")
+    return {
+        session: calculate_backtest_metrics(
+            [trade for trade in trades if trade.session == session],
+            [decision for decision in decisions if decision.session == session],
+        )
+        for session in sessions
+    }
+
+
+def export_backtest_trades_csv(
+    report: BacktestReport,
+    path: Path,
+) -> None:
+    fieldnames = [
+        "entry_time",
+        "exit_time",
+        "session",
+        "action",
+        "entry",
+        "stop_loss",
+        "tp1",
+        "tp2",
+        "result",
+        "r_multiple",
+        "risk_reward",
+        "volume",
+        "pnl",
+        "balance_after",
+        "loss_reason",
+        "reject_reasons_before_entry",
+    ]
+    _write_csv_rows(
+        path,
+        fieldnames,
+        [
+            {
+                "entry_time": trade.entry_time,
+                "exit_time": trade.exit_time,
+                "session": trade.session,
+                "action": trade.action.value,
+                "entry": trade.entry,
+                "stop_loss": trade.stop_loss,
+                "tp1": trade.tp1,
+                "tp2": trade.tp2,
+                "result": trade.result,
+                "r_multiple": trade.r_multiple,
+                "risk_reward": trade.risk_reward,
+                "volume": trade.volume,
+                "pnl": trade.pnl,
+                "balance_after": trade.balance_after,
+                "loss_reason": trade.loss_reason,
+                "reject_reasons_before_entry": _format_reasons(trade.reject_reasons_before_entry),
+            }
+            for trade in report.trades
+        ],
+    )
+
+
+def export_backtest_decisions_csv(
+    report: BacktestReport,
+    path: Path,
+) -> None:
+    fieldnames = [
+        "timestamp",
+        "session",
+        "symbol",
+        "timeframe",
+        "action",
+        "stage",
+        "approved",
+        "reasons",
+        "htf_bias",
+        "execution_trend",
+        "price_location",
+        "candle_confirmation_summary",
+        "risk_reward",
+    ]
+    _write_csv_rows(
+        path,
+        fieldnames,
+        [
+            {
+                "timestamp": decision.timestamp,
+                "session": decision.session,
+                "symbol": decision.symbol,
+                "timeframe": decision.timeframe,
+                "action": decision.action,
+                "stage": decision.stage,
+                "approved": decision.approved,
+                "reasons": _format_reasons(decision.reasons),
+                "htf_bias": decision.htf_bias,
+                "execution_trend": decision.execution_trend,
+                "price_location": decision.price_location,
+                "candle_confirmation_summary": decision.candle_confirmation_summary,
+                "risk_reward": decision.risk_reward,
+            }
+            for decision in report.decisions
+        ],
+    )
+
+
+def export_backtest_session_summary_csv(
+    report: BacktestReport,
+    path: Path,
+) -> None:
+    fieldnames = [
+        "session",
+        "total_trades",
+        "approved_trades",
+        "rejected_trades",
+        "skipped_trades",
+        "win_rate",
+        "loss_rate",
+        "profit_factor",
+        "max_drawdown",
+        "average_win",
+        "average_loss",
+        "average_rr",
+        "max_consecutive_losses",
+        "net_r",
+    ]
+    _write_csv_rows(
+        path,
+        fieldnames,
+        [
+            {"session": session, **_metrics_to_dict(metrics)}
+            for session, metrics in report.session_metrics.items()
+        ],
+    )
+
+
+def export_backtest_summary_json(
+    report: BacktestReport,
+    path: Path,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "metrics": _metrics_to_dict(report.metrics),
+        "session_metrics": {
+            session: _metrics_to_dict(metrics)
+            for session, metrics in report.session_metrics.items()
+        },
+        "reject_reason_summary": report.reject_reason_summary,
+        "skip_reason_summary": report.skip_reason_summary,
+        "stopped_reason": report.stopped_reason,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def export_backtest_report(
+    report: BacktestReport,
+    output_dir: Path,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    export_backtest_trades_csv(report, output_dir / "backtest_trades.csv")
+    export_backtest_decisions_csv(report, output_dir / "backtest_decisions.csv")
+    export_backtest_session_summary_csv(report, output_dir / "backtest_session_summary.csv")
+    export_backtest_summary_json(report, output_dir / "backtest_summary.json")
 
 
 def _load_backtest_range(execution: list[Candle]) -> BacktestRange:
@@ -502,6 +1385,170 @@ def _write_trades_csv(trades: list[BacktestTrade], path: Path) -> None:
                 "balance_after": trade.balance_after,
             }
             writer.writerow(row)
+
+
+def _write_csv_rows(path: Path, fieldnames: list[str], rows: list[dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _metrics_to_dict(metrics: BacktestMetrics) -> dict[str, object]:
+    return {
+        "total_trades": metrics.total_trades,
+        "approved_trades": metrics.approved_trades,
+        "rejected_trades": metrics.rejected_trades,
+        "skipped_trades": metrics.skipped_trades,
+        "win_rate": metrics.win_rate,
+        "loss_rate": metrics.loss_rate,
+        "profit_factor": metrics.profit_factor,
+        "max_drawdown": metrics.max_drawdown,
+        "average_win": metrics.average_win,
+        "average_loss": metrics.average_loss,
+        "average_rr": metrics.average_rr,
+        "max_consecutive_losses": metrics.max_consecutive_losses,
+        "net_r": metrics.net_r,
+    }
+
+
+def _format_reasons(reasons: tuple[str, ...]) -> str:
+    return " | ".join(reasons)
+
+
+def _backtest_decision_without_signal(
+    config: SignalConfig,
+    current_time: datetime,
+    stage: str,
+    approved: bool,
+    reasons: tuple[str, ...],
+) -> BacktestDecision:
+    return BacktestDecision(
+        timestamp=current_time.isoformat(),
+        session=classify_session(current_time),
+        symbol=config.symbol,
+        timeframe=execution_timeframe_for_backtest(config),
+        action=None,
+        stage=stage,
+        approved=approved,
+        reasons=reasons,
+        htf_bias=None,
+        execution_trend=None,
+        price_location=None,
+        candle_confirmation_summary=None,
+        risk_reward=None,
+    )
+
+
+def _signal_text_attr(signal: object, name: str) -> str | None:
+    value = getattr(signal, name, None)
+    return value if isinstance(value, str) and value else None
+
+
+def _enhanced_exit_hits(
+    candidate: BacktestCandidate,
+    candle: Candle,
+    target: float,
+) -> tuple[bool, bool]:
+    if candidate.action == SignalAction.BUY:
+        return candle.low <= candidate.stop_loss, candle.high >= target
+    return candle.high >= candidate.stop_loss, candle.low <= target
+
+
+def _enhanced_trade_result(
+    candidate: BacktestCandidate,
+    entry_time: str,
+    exit_time: str,
+    target: float,
+    result: str,
+    r_multiple: float,
+    loss_reason: str | None,
+) -> BacktestTradeResult:
+    return BacktestTradeResult(
+        action=candidate.action,
+        session=candidate.decision.session,
+        entry_time=entry_time,
+        exit_time=exit_time,
+        entry=candidate.entry,
+        stop_loss=candidate.stop_loss,
+        tp1=candidate.tp1,
+        tp2=target,
+        result=result,
+        r_multiple=r_multiple,
+        risk_reward=candidate.risk_reward,
+        volume=None,
+        pnl=None,
+        balance_after=None,
+        loss_reason=loss_reason,
+        reject_reasons_before_entry=candidate.decision.reasons,
+    )
+
+
+def _average(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def _profit_factor(gross_win: float, gross_loss: float) -> float:
+    if gross_loss == 0:
+        return gross_win if gross_win > 0 else 0.0
+    return gross_win / gross_loss
+
+
+def _max_enhanced_drawdown(trades: list[BacktestTradeResult]) -> float:
+    balances = [trade.balance_after for trade in trades if trade.balance_after is not None]
+    if balances:
+        peak = balances[0]
+        max_drawdown = 0.0
+        for balance in balances:
+            peak = max(peak, balance)
+            max_drawdown = max(max_drawdown, peak - balance)
+        return max_drawdown
+
+    equity = 0.0
+    peak = 0.0
+    max_drawdown = 0.0
+    for trade in trades:
+        equity += trade.r_multiple
+        peak = max(peak, equity)
+        max_drawdown = max(max_drawdown, peak - equity)
+    return max_drawdown
+
+
+def _max_consecutive_losses(trades: list[BacktestTradeResult]) -> int:
+    max_losses = 0
+    current_losses = 0
+    for trade in trades:
+        if trade.result.startswith("LOSS"):
+            current_losses += 1
+            max_losses = max(max_losses, current_losses)
+        elif trade.result == "WIN":
+            current_losses = 0
+    return max_losses
+
+
+def _is_reject_decision(decision: BacktestDecision) -> bool:
+    if decision.approved:
+        return False
+    return decision.stage not in {"skip", "skipped", "insufficient_candles"}
+
+
+def _is_skip_decision(decision: BacktestDecision) -> bool:
+    if decision.approved:
+        return False
+    return decision.stage in {"skip", "skipped", "insufficient_candles"}
+
+
+def _summarize_decision_reasons(decisions: Iterable[BacktestDecision]) -> dict[str, int]:
+    summary: dict[str, int] = {}
+    for decision in decisions:
+        reasons = decision.reasons or ("unspecified",)
+        for reason in reasons:
+            summary[reason] = summary.get(reason, 0) + 1
+    return summary
 
 
 if __name__ == "__main__":
