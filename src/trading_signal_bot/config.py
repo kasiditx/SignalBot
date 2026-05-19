@@ -3,7 +3,15 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .models import AutoTradeConfig, SignalConfig, TelegramConfig, WebhookConfig
+from .models import (
+    AutoTradeConfig,
+    ExecutionPolicyConfig,
+    RiskConfig,
+    SignalConfig,
+    TelegramConfig,
+    TimeframePlan,
+    WebhookConfig,
+)
 
 
 def load_env_file(path: str = ".env") -> None:
@@ -54,11 +62,33 @@ def _get_float(name: str, default: float, minimum: float) -> float:
     return value
 
 
+def _get_csv_tuple(name: str, default: tuple[str, ...], *, uppercase: bool = True) -> tuple[str, ...]:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    values = tuple(part.strip() for part in raw_value.split(",") if part.strip())
+    if not values:
+        return default
+    if uppercase:
+        return tuple(value.upper() for value in values)
+    return values
+
+
 def load_signal_config() -> SignalConfig:
     fast_ema_period = _get_int("SIGNAL_FAST_EMA", 12, 2)
     slow_ema_period = _get_int("SIGNAL_SLOW_EMA", 26, 3)
     if fast_ema_period >= slow_ema_period:
         raise ValueError("SIGNAL_FAST_EMA must be lower than SIGNAL_SLOW_EMA")
+
+    timeframe_plan = TimeframePlan(
+        htf_timeframes=_get_csv_tuple("SIGNAL_HTF_TIMEFRAMES", ("H4", "H1")),
+        zone_timeframes=_get_csv_tuple("SIGNAL_ZONE_TIMEFRAMES", ("M30", "M15")),
+        momentum_timeframe=(os.getenv("SIGNAL_MOMENTUM_TIMEFRAME", "M5").strip().upper() or "M5"),
+        execution_timeframe=(os.getenv("SIGNAL_EXECUTION_TIMEFRAME", "M1").strip().upper() or "M1"),
+        timeframe_order=_get_csv_tuple("SIGNAL_TIMEFRAME_ORDER", ("H4", "H1", "M30", "M15", "M5", "M1")),
+    )
+    required_timeframes = _get_csv_tuple("SIGNAL_REQUIRED_TIMEFRAMES", ())
 
     timeframe_paths = {
         "D1": os.getenv("SIGNAL_CSV_PATH_D1", "").strip(),
@@ -67,10 +97,37 @@ def load_signal_config() -> SignalConfig:
         "M30": os.getenv("SIGNAL_CSV_PATH_M30", "").strip(),
         "M15": os.getenv("SIGNAL_CSV_PATH_M15", "").strip(),
         "M5": os.getenv("SIGNAL_CSV_PATH_M5", "").strip(),
+        "M1": os.getenv("SIGNAL_CSV_PATH_M1", "").strip(),
     }
+    for timeframe in required_timeframes:
+        timeframe_paths.setdefault(timeframe, os.getenv(f"SIGNAL_CSV_PATH_{timeframe}", "").strip())
+
     trade_mode = os.getenv("SIGNAL_TRADE_MODE", "high_winrate").strip().lower() or "high_winrate"
     if trade_mode not in {"high_winrate", "active"}:
         raise ValueError("SIGNAL_TRADE_MODE must be high_winrate or active")
+
+    risk_reward = _get_float("SIGNAL_RISK_REWARD", 1.5, 0.1)
+    if risk_reward < 1.5:
+        raise ValueError("SIGNAL_RISK_REWARD must be at least 1.5 for controlled risk/reward")
+
+    risk_config = RiskConfig(
+        risk_per_trade=_get_float("RISK_PER_TRADE", 1.0, 0.01),
+        max_daily_loss=_get_float("MAX_DAILY_LOSS", 3.0, 0.01),
+        max_trades_per_day=_get_int("MAX_TRADES_PER_DAY", 8, 1),
+        max_consecutive_losses=_get_int("MAX_CONSECUTIVE_LOSSES", 3, 1),
+        cooldown_minutes=_get_int("COOLDOWN_MINUTES", 30, 0),
+    )
+    if risk_config.risk_per_trade > 1.0:
+        raise ValueError("RISK_PER_TRADE should not exceed 1.0 for this M1 scalping configuration")
+
+    execution_policy_config = ExecutionPolicyConfig(
+        max_spread_points=_get_int("MAX_SPREAD_POINTS", 500, 0),
+        allowed_sessions=_get_csv_tuple("ALLOWED_SESSIONS", ("London", "NewYork"), uppercase=False),
+        enable_news_filter=_get_bool("ENABLE_NEWS_FILTER", False),
+        enable_break_even=_get_bool("ENABLE_BREAK_EVEN", True),
+        enable_trailing_stop=_get_bool("ENABLE_TRAILING_STOP", True),
+        enable_partial_close=_get_bool("ENABLE_PARTIAL_CLOSE", False),
+    )
 
     return SignalConfig(
         symbol=os.getenv("SIGNAL_SYMBOL", "XAUUSD").strip() or "XAUUSD",
@@ -82,7 +139,7 @@ def load_signal_config() -> SignalConfig:
         atr_period=_get_int("SIGNAL_ATR_PERIOD", 14, 2),
         atr_multiplier=_get_float("SIGNAL_ATR_MULTIPLIER", 1.5, 0.1),
         body_break_atr_ratio=_get_float("SIGNAL_BODY_BREAK_ATR_RATIO", 0.20, 0.01),
-        risk_reward=_get_float("SIGNAL_RISK_REWARD", 2.0, 0.1),
+        risk_reward=risk_reward,
         min_candles=_get_int("SIGNAL_MIN_CANDLES", 60, 30),
         max_candle_age_minutes=_get_int("SIGNAL_MAX_CANDLE_AGE_MINUTES", 180, 1),
         multi_timeframe_enabled=_get_bool("SIGNAL_MULTI_TIMEFRAME", False),
@@ -90,6 +147,13 @@ def load_signal_config() -> SignalConfig:
         dry_run=_get_bool("SIGNAL_DRY_RUN", True),
         send_wait=_get_bool("SIGNAL_SEND_WAIT", False),
         trade_mode=trade_mode,
+        execution_timeframe=timeframe_plan.execution_timeframe,
+        momentum_timeframe=timeframe_plan.momentum_timeframe,
+        zone_timeframes=timeframe_plan.zone_timeframes,
+        htf_timeframes=timeframe_plan.htf_timeframes,
+        timeframe_order=timeframe_plan.timeframe_order,
+        risk_config=risk_config,
+        execution_policy_config=execution_policy_config,
     )
 
 

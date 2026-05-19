@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import fcntl
 import json
 import logging
 import os
@@ -62,6 +61,29 @@ def main() -> int:
         LOGGER.error("Signal poller is already running. Lock file: %s", lock_path)
         return 1
 
+    try:
+        return _run_polling_loop(
+            interval_seconds=interval_seconds,
+            stale_log_seconds=stale_log_seconds,
+            error_log_seconds=error_log_seconds,
+            allow_market_closed_stale=allow_market_closed_stale,
+            market_closed_stale_hours=market_closed_stale_hours,
+            state_path=state_path,
+            log_state_path=log_state_path,
+        )
+    finally:
+        _release_lock(lock_file)
+
+
+def _run_polling_loop(
+    interval_seconds: int,
+    stale_log_seconds: int,
+    error_log_seconds: int,
+    allow_market_closed_stale: bool,
+    market_closed_stale_hours: int,
+    state_path: Path,
+    log_state_path: Path,
+) -> int:
     signal_config = load_signal_config()
     telegram_config = load_telegram_config()
     auto_trade_config = load_auto_trade_config()
@@ -262,17 +284,75 @@ def _get_bool_env(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _acquire_lock(path: Path) -> object | None:
+class _AtomicLock:
+    def __init__(self, path: Path, fd: int, token: str) -> None:
+        self.path = path
+        self.fd = fd
+        self.token = token
+        self.released = False
+
+
+def _acquire_lock(path: Path, stale_seconds: int | None = None) -> _AtomicLock | None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock_file = path.open("w", encoding="utf-8")
     try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        lock_file.close()
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        if stale_seconds is not None and _remove_stale_lock(path, stale_seconds):
+            return _acquire_lock(path, stale_seconds=None)
         return None
-    lock_file.write(str(os.getpid()))
-    lock_file.flush()
-    return lock_file
+
+    token = f"{os.getpid()}:{time.time_ns()}"
+    metadata = {
+        "pid": os.getpid(),
+        "timestamp": datetime.now(tz=UTC).isoformat(),
+        "token": token,
+    }
+    try:
+        os.write(fd, json.dumps(metadata, ensure_ascii=False).encode("utf-8"))
+    except OSError:
+        os.close(fd)
+        _unlink_lock_file(path)
+        raise
+    return _AtomicLock(path=path, fd=fd, token=token)
+
+
+def _release_lock(lock: _AtomicLock) -> None:
+    if lock.released:
+        return
+    lock.released = True
+    try:
+        os.close(lock.fd)
+    finally:
+        _unlink_owned_lock_file(lock)
+
+
+def _remove_stale_lock(path: Path, stale_seconds: int) -> bool:
+    if stale_seconds < 0:
+        return False
+    try:
+        age_seconds = time.time() - path.stat().st_mtime
+    except OSError:
+        return False
+    if age_seconds <= stale_seconds:
+        return False
+    _unlink_lock_file(path)
+    return True
+
+
+def _unlink_owned_lock_file(lock: _AtomicLock) -> None:
+    try:
+        data = json.loads(lock.path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if data.get("token") == lock.token:
+        _unlink_lock_file(lock.path)
+
+
+def _unlink_lock_file(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
 
 
 if __name__ == "__main__":

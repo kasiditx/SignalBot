@@ -4,21 +4,32 @@ from .data import load_candles_from_csv
 from .models import Candle, SignalConfig, TrendDirection
 
 
-TIMEFRAME_ORDER = ("D1", "H4", "H1", "M30", "M15", "M5")
-HIGHER_TIMEFRAMES = ("D1", "H4", "H1")
+TIMEFRAME_ORDER = ("H4", "H1", "M30", "M15", "M5", "M1")
+HIGHER_TIMEFRAMES = ("H4", "H1")
 CONFIRMATION_TIMEFRAMES = ("M30", "M15")
+# Backward compatibility for modules that still import this constant directly.
+# New routing should use config.execution_timeframe instead.
 EXECUTION_TIMEFRAME = "M5"
 
 
 def load_timeframe_candles(config: SignalConfig) -> dict[str, list[Candle]]:
     candles_by_timeframe: dict[str, list[Candle]] = {}
     if not config.multi_timeframe_enabled:
-        candles_by_timeframe[config.timeframe] = load_candles_from_csv(config.csv_path)
+        execution_timeframe = _execution_timeframe(config)
+        candles = load_candles_from_csv(config.csv_path)
+        candles_by_timeframe[execution_timeframe] = candles
+        if config.timeframe != execution_timeframe:
+            candles_by_timeframe[config.timeframe] = candles
         return candles_by_timeframe
 
-    for timeframe in TIMEFRAME_ORDER:
+    for timeframe in _timeframes_to_load(config):
         path = config.timeframe_paths.get(timeframe)
         if not path:
+            if timeframe == _execution_timeframe(config):
+                raise ValueError(
+                    f"SIGNAL_CSV_PATH_{timeframe} is required for execution timeframe "
+                    f"{timeframe} when SIGNAL_MULTI_TIMEFRAME=true"
+                )
             raise ValueError(f"SIGNAL_CSV_PATH_{timeframe} is required when SIGNAL_MULTI_TIMEFRAME=true")
         candles_by_timeframe[timeframe] = load_candles_from_csv(path)
 
@@ -26,8 +37,13 @@ def load_timeframe_candles(config: SignalConfig) -> dict[str, list[Candle]]:
 
 
 def execution_candles(candles_by_timeframe: dict[str, list[Candle]], config: SignalConfig) -> list[Candle]:
+    execution_timeframe = _execution_timeframe(config)
     if config.multi_timeframe_enabled:
-        return candles_by_timeframe[EXECUTION_TIMEFRAME]
+        if execution_timeframe not in candles_by_timeframe:
+            raise ValueError(f"No candles for execution timeframe {execution_timeframe}")
+        return candles_by_timeframe[execution_timeframe]
+    if execution_timeframe in candles_by_timeframe:
+        return candles_by_timeframe[execution_timeframe]
     return candles_by_timeframe[config.timeframe]
 
 
@@ -55,23 +71,30 @@ def trend_map(candles_by_timeframe: dict[str, list[Candle]]) -> dict[str, TrendD
     return {
         timeframe: trend_direction(candles)
         for timeframe, candles in candles_by_timeframe.items()
-        if timeframe in TIMEFRAME_ORDER
+        if timeframe in _known_timeframes()
     }
 
 
-def dominant_bias(trends: dict[str, TrendDirection]) -> TrendDirection:
-    bullish = sum(1 for timeframe in HIGHER_TIMEFRAMES if trends.get(timeframe) == TrendDirection.BULLISH)
-    bearish = sum(1 for timeframe in HIGHER_TIMEFRAMES if trends.get(timeframe) == TrendDirection.BEARISH)
-    if bullish >= 2 and bullish > bearish:
+def dominant_bias(
+    trends: dict[str, TrendDirection],
+    htf_timeframes: tuple[str, ...] = HIGHER_TIMEFRAMES,
+) -> TrendDirection:
+    bullish = sum(1 for timeframe in htf_timeframes if trends.get(timeframe) == TrendDirection.BULLISH)
+    bearish = sum(1 for timeframe in htf_timeframes if trends.get(timeframe) == TrendDirection.BEARISH)
+    required_votes = max(1, (len(htf_timeframes) // 2) + 1)
+    if bullish >= required_votes and bullish > bearish:
         return TrendDirection.BULLISH
-    if bearish >= 2 and bearish > bullish:
+    if bearish >= required_votes and bearish > bullish:
         return TrendDirection.BEARISH
     return TrendDirection.SIDEWAYS
 
 
-def confirmation_bias(trends: dict[str, TrendDirection]) -> TrendDirection:
-    bullish = sum(1 for timeframe in CONFIRMATION_TIMEFRAMES if trends.get(timeframe) == TrendDirection.BULLISH)
-    bearish = sum(1 for timeframe in CONFIRMATION_TIMEFRAMES if trends.get(timeframe) == TrendDirection.BEARISH)
+def confirmation_bias(
+    trends: dict[str, TrendDirection],
+    confirmation_timeframes: tuple[str, ...] = CONFIRMATION_TIMEFRAMES,
+) -> TrendDirection:
+    bullish = sum(1 for timeframe in confirmation_timeframes if trends.get(timeframe) == TrendDirection.BULLISH)
+    bearish = sum(1 for timeframe in confirmation_timeframes if trends.get(timeframe) == TrendDirection.BEARISH)
     if bullish >= 1 and bullish >= bearish:
         return TrendDirection.BULLISH
     if bearish >= 1 and bearish >= bullish:
@@ -79,8 +102,31 @@ def confirmation_bias(trends: dict[str, TrendDirection]) -> TrendDirection:
     return TrendDirection.SIDEWAYS
 
 
-def format_trend_summary(trends: dict[str, TrendDirection]) -> str:
+def format_trend_summary(
+    trends: dict[str, TrendDirection],
+    timeframe_order: tuple[str, ...] = TIMEFRAME_ORDER,
+) -> str:
     return " | ".join(
         f"{timeframe}:{trends.get(timeframe, TrendDirection.SIDEWAYS).value}"
-        for timeframe in TIMEFRAME_ORDER
+        for timeframe in timeframe_order
     )
+
+
+def _execution_timeframe(config: SignalConfig) -> str:
+    return getattr(config, "execution_timeframe", EXECUTION_TIMEFRAME)
+
+
+def _timeframe_order(config: SignalConfig) -> tuple[str, ...]:
+    return getattr(config, "timeframe_order", TIMEFRAME_ORDER)
+
+
+def _timeframes_to_load(config: SignalConfig) -> tuple[str, ...]:
+    timeframe_order = _timeframe_order(config)
+    execution_timeframe = _execution_timeframe(config)
+    if execution_timeframe in timeframe_order:
+        return timeframe_order
+    return (*timeframe_order, execution_timeframe)
+
+
+def _known_timeframes() -> set[str]:
+    return set(TIMEFRAME_ORDER).union({"D1", EXECUTION_TIMEFRAME})

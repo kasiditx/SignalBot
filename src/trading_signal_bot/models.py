@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 
@@ -22,6 +22,13 @@ class TrendDirection(str, Enum):
     SIDEWAYS = "SIDEWAYS"
 
 
+class TimeframeRole(str, Enum):
+    HTF = "HTF"
+    ZONE = "ZONE"
+    MOMENTUM = "MOMENTUM"
+    EXECUTION = "EXECUTION"
+
+
 @dataclass(frozen=True)
 class Candle:
     timestamp: str
@@ -30,6 +37,42 @@ class Candle:
     low: float
     close: float
     volume: float
+
+
+@dataclass(frozen=True)
+class TimeframePlan:
+    htf_timeframes: tuple[str, ...] = ("H4", "H1")
+    zone_timeframes: tuple[str, ...] = ("M30", "M15")
+    momentum_timeframe: str = "M5"
+    execution_timeframe: str = "M1"
+    timeframe_order: tuple[str, ...] = ("H4", "H1", "M30", "M15", "M5", "M1")
+
+
+@dataclass(frozen=True)
+class TimeframeContext:
+    timeframe: str
+    role: TimeframeRole
+    direction: TrendDirection
+    latest_timestamp: str | None = None
+
+
+@dataclass(frozen=True)
+class RiskConfig:
+    risk_per_trade: float = 1.0
+    max_daily_loss: float = 3.0
+    max_trades_per_day: int = 8
+    max_consecutive_losses: int = 3
+    cooldown_minutes: int = 30
+
+
+@dataclass(frozen=True)
+class ExecutionPolicyConfig:
+    max_spread_points: int = 500
+    allowed_sessions: tuple[str, ...] = ("London", "NewYork")
+    enable_news_filter: bool = False
+    enable_break_even: bool = True
+    enable_trailing_stop: bool = True
+    enable_partial_close: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,6 +94,17 @@ class SignalConfig:
     dry_run: bool
     send_wait: bool
     trade_mode: str = "high_winrate"
+    execution_timeframe: str = "M1"
+    momentum_timeframe: str = "M5"
+    zone_timeframes: tuple[str, ...] = ("M30", "M15")
+    htf_timeframes: tuple[str, ...] = ("H4", "H1")
+    timeframe_order: tuple[str, ...] = ("H4", "H1", "M30", "M15", "M5", "M1")
+    risk_config: RiskConfig = field(default_factory=RiskConfig)
+    execution_policy_config: ExecutionPolicyConfig = field(default_factory=ExecutionPolicyConfig)
+
+    def __post_init__(self) -> None:
+        if self.risk_reward < 1.5:
+            raise ValueError("SignalConfig.risk_reward must be at least 1.5")
 
 
 @dataclass(frozen=True)
