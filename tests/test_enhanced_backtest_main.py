@@ -14,16 +14,22 @@ from trading_signal_bot.backtest import (
     BacktestDecision,
     BacktestMetrics,
     BacktestRange,
+    BacktestRealismConfig,
     BacktestReport,
+    BacktestTradeResult,
 )
 from trading_signal_bot.enhanced_backtest_main import (
+    _get_bool_env,
+    _get_float_env,
+    _get_int_env,
     build_backtest_range_from_env,
+    build_realism_config_from_env,
     enhanced_backtest_mode_from_env,
     enhanced_backtest_output_dir_from_env,
     format_enhanced_backtest_summary,
     main,
 )
-from trading_signal_bot.models import Candle, SignalConfig
+from trading_signal_bot.models import Candle, SignalAction, SignalConfig
 
 
 class EnhancedBacktestMainTest(unittest.TestCase):
@@ -47,16 +53,109 @@ class EnhancedBacktestMainTest(unittest.TestCase):
         with patch.dict(os.environ, {"ENHANCED_BACKTEST_MODE": "simulation"}, clear=True):
             self.assertEqual(enhanced_backtest_mode_from_env(), "simulation")
 
+    def test_mode_from_env_realism(self) -> None:
+        with patch.dict(os.environ, {"ENHANCED_BACKTEST_MODE": "realism"}, clear=True):
+            self.assertEqual(enhanced_backtest_mode_from_env(), "realism")
+
     def test_mode_from_env_is_case_insensitive(self) -> None:
         with patch.dict(os.environ, {"ENHANCED_BACKTEST_MODE": "Decision"}, clear=True):
             self.assertEqual(enhanced_backtest_mode_from_env(), "decision")
         with patch.dict(os.environ, {"ENHANCED_BACKTEST_MODE": "SIMULATION"}, clear=True):
             self.assertEqual(enhanced_backtest_mode_from_env(), "simulation")
 
+    def test_mode_from_env_realism_is_case_insensitive(self) -> None:
+        with patch.dict(os.environ, {"ENHANCED_BACKTEST_MODE": "REALISM"}, clear=True):
+            self.assertEqual(enhanced_backtest_mode_from_env(), "realism")
+        with patch.dict(os.environ, {"ENHANCED_BACKTEST_MODE": "Realism"}, clear=True):
+            self.assertEqual(enhanced_backtest_mode_from_env(), "realism")
+
     def test_mode_from_env_invalid_raises(self) -> None:
         with patch.dict(os.environ, {"ENHANCED_BACKTEST_MODE": "live"}, clear=True):
-            with self.assertRaisesRegex(ValueError, "ENHANCED_BACKTEST_MODE must be decision or simulation"):
+            with self.assertRaisesRegex(ValueError, "ENHANCED_BACKTEST_MODE must be decision, simulation, or realism"):
                 enhanced_backtest_mode_from_env()
+
+    def test_build_realism_config_from_env_defaults(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            realism = build_realism_config_from_env()
+
+        self.assertEqual(realism.initial_balance, 10000.0)
+        self.assertEqual(realism.risk_percent, 1.0)
+        self.assertEqual(realism.contract_size, 100.0)
+        self.assertEqual(realism.min_volume, 0.01)
+        self.assertEqual(realism.max_volume, 10.0)
+        self.assertEqual(realism.volume_step, 0.01)
+        self.assertTrue(realism.allow_min_volume)
+        self.assertEqual(realism.spread_points, 20.0)
+        self.assertEqual(realism.point_value, 0.01)
+        self.assertEqual(realism.slippage_points, 5.0)
+        self.assertEqual(realism.commission_per_lot, 7.0)
+        self.assertEqual(realism.max_daily_loss_percent, 3.0)
+        self.assertEqual(realism.max_consecutive_losses, 3)
+        self.assertEqual(realism.cooldown_minutes, 30)
+
+    def test_build_realism_config_from_env_overrides_all_fields(self) -> None:
+        env = {
+            "BACKTEST_INITIAL_BALANCE": "20000",
+            "BACKTEST_RISK_PERCENT": "0.5",
+            "BACKTEST_CONTRACT_SIZE": "50",
+            "BACKTEST_MIN_VOLUME": "0.02",
+            "BACKTEST_MAX_VOLUME": "5",
+            "BACKTEST_VOLUME_STEP": "0.02",
+            "BACKTEST_ALLOW_MIN_VOLUME": "false",
+            "BACKTEST_SPREAD_POINTS": "15",
+            "BACKTEST_POINT_VALUE": "0.1",
+            "BACKTEST_SLIPPAGE_POINTS": "2",
+            "BACKTEST_COMMISSION_PER_LOT": "3.5",
+            "BACKTEST_MAX_DAILY_LOSS_PERCENT": "2",
+            "BACKTEST_MAX_CONSECUTIVE_LOSSES": "2",
+            "BACKTEST_COOLDOWN_MINUTES": "45",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            realism = build_realism_config_from_env()
+
+        self.assertEqual(realism.initial_balance, 20000.0)
+        self.assertEqual(realism.risk_percent, 0.5)
+        self.assertEqual(realism.contract_size, 50.0)
+        self.assertEqual(realism.min_volume, 0.02)
+        self.assertEqual(realism.max_volume, 5.0)
+        self.assertEqual(realism.volume_step, 0.02)
+        self.assertFalse(realism.allow_min_volume)
+        self.assertEqual(realism.spread_points, 15.0)
+        self.assertEqual(realism.point_value, 0.1)
+        self.assertEqual(realism.slippage_points, 2.0)
+        self.assertEqual(realism.commission_per_lot, 3.5)
+        self.assertEqual(realism.max_daily_loss_percent, 2.0)
+        self.assertEqual(realism.max_consecutive_losses, 2)
+        self.assertEqual(realism.cooldown_minutes, 45)
+
+    def test_get_bool_env_parses_true_and_false(self) -> None:
+        for value in ("true", "1", "yes", "on"):
+            with patch.dict(os.environ, {"BOOL_TEST": value}, clear=True):
+                self.assertTrue(_get_bool_env("BOOL_TEST", False))
+        for value in ("false", "0", "no", "off"):
+            with patch.dict(os.environ, {"BOOL_TEST": value}, clear=True):
+                self.assertFalse(_get_bool_env("BOOL_TEST", True))
+
+    def test_invalid_float_env_raises(self) -> None:
+        with patch.dict(os.environ, {"FLOAT_TEST": "abc"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "FLOAT_TEST must be a number"):
+                _get_float_env("FLOAT_TEST", 1.0)
+
+    def test_invalid_int_env_raises(self) -> None:
+        with patch.dict(os.environ, {"INT_TEST": "1.5"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "INT_TEST must be an integer"):
+                _get_int_env("INT_TEST", 1)
+
+    def test_invalid_bool_env_raises(self) -> None:
+        with patch.dict(os.environ, {"BOOL_TEST": "maybe"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "BOOL_TEST must be true or false"):
+                _get_bool_env("BOOL_TEST", True)
+
+    def test_realism_config_min_volume_greater_than_max_raises(self) -> None:
+        with patch.dict(os.environ, {"BACKTEST_MIN_VOLUME": "2", "BACKTEST_MAX_VOLUME": "1"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "BACKTEST_MIN_VOLUME must be lower than or equal to BACKTEST_MAX_VOLUME"):
+                build_realism_config_from_env()
 
     def test_build_range_returns_none_without_lookback_env(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -80,7 +179,7 @@ class EnhancedBacktestMainTest(unittest.TestCase):
     def test_summary_has_mode(self) -> None:
         summary = format_enhanced_backtest_summary(_report(), Path("logs/enhanced_backtest"))
 
-        self.assertIn("offline decision report only", summary)
+        self.assertIn("Mode: decision-only offline report", summary)
 
     def test_summary_has_decision_mode_label(self) -> None:
         summary = format_enhanced_backtest_summary(_report(), Path("logs/enhanced_backtest"), mode="decision")
@@ -92,38 +191,150 @@ class EnhancedBacktestMainTest(unittest.TestCase):
 
         self.assertIn("Mode: offline simulation report", summary)
 
+    def test_summary_has_realism_mode_balance_lines(self) -> None:
+        summary = format_enhanced_backtest_summary(
+            _realism_report(),
+            Path("logs/enhanced_backtest"),
+            mode="realism",
+            realism=_realism_config(),
+        )
+
+        self.assertIn("Mode: offline realism report", summary)
+        self.assertIn("Initial balance: 10000.00", summary)
+        self.assertIn("Final balance: 10118.00", summary)
+        self.assertIn("Net PnL: 118.00", summary)
+
     def test_summary_has_decision_counts(self) -> None:
         summary = format_enhanced_backtest_summary(_report(), Path("logs/enhanced_backtest"))
 
-        self.assertIn("Decisions: 3", summary)
-        self.assertIn("Approved decisions: 1", summary)
-        self.assertIn("Rejected decisions: 1", summary)
-        self.assertIn("Skipped decisions: 1", summary)
+        self.assertIn("Decisions:", summary)
+        self.assertIn("Total decisions: 3", summary)
+        self.assertIn("Approved: 1", summary)
+        self.assertIn("Rejected: 1", summary)
+        self.assertIn("Skipped: 1", summary)
 
-    def test_summary_has_trades_simulated_zero(self) -> None:
+    def test_decision_summary_does_not_show_trade_balance_cost_or_session_sections(self) -> None:
         summary = format_enhanced_backtest_summary(_report(), Path("logs/enhanced_backtest"))
 
-        self.assertIn("Trades simulated: 0", summary)
+        self.assertNotIn("Trades:", summary)
+        self.assertNotIn("Balance:", summary)
+        self.assertNotIn("Costs:", summary)
+        self.assertNotIn("Session PnL:", summary)
+
+    def test_simulation_summary_has_trade_section(self) -> None:
+        summary = format_enhanced_backtest_summary(
+            _realism_report(),
+            Path("logs/enhanced_backtest"),
+            mode="simulation",
+        )
+
+        self.assertIn("Mode: offline simulation report", summary)
+        self.assertIn("Trades:", summary)
+        self.assertIn("Trades simulated: 1", summary)
+        self.assertIn("Win rate: 100.00%", summary)
+        self.assertIn("Profit factor: 1.50", summary)
+        self.assertIn("Net R: 1.50R", summary)
+
+    def test_simulation_summary_does_not_show_realism_only_sections(self) -> None:
+        summary = format_enhanced_backtest_summary(
+            _realism_report(),
+            Path("logs/enhanced_backtest"),
+            mode="simulation",
+        )
+
+        self.assertNotIn("Balance:", summary)
+        self.assertNotIn("Costs:", summary)
+        self.assertNotIn("Session PnL:", summary)
+
+    def test_realism_summary_has_trade_balance_cost_risk_and_session_sections(self) -> None:
+        summary = format_enhanced_backtest_summary(
+            _realism_report(),
+            Path("logs/enhanced_backtest"),
+            mode="realism",
+            realism=_realism_config(),
+        )
+
+        for expected in (
+            "Trades:",
+            "Balance:",
+            "Initial balance",
+            "Final balance",
+            "Net PnL",
+            "Return %",
+            "Max drawdown",
+            "Costs:",
+            "Commission",
+            "Spread cost",
+            "Slippage cost",
+            "Total cost",
+            "Risk skips:",
+            "Session PnL:",
+            "Asia",
+            "London",
+            "NewYork",
+            "Other",
+        ):
+            self.assertIn(expected, summary)
+
+    def test_realism_summary_without_realism_config_skips_balance_and_costs(self) -> None:
+        summary = format_enhanced_backtest_summary(
+            _realism_report(),
+            Path("logs/enhanced_backtest"),
+            mode="realism",
+            realism=None,
+        )
+
+        self.assertIn("Mode: offline realism report", summary)
+        self.assertNotIn("Balance:", summary)
+        self.assertNotIn("Costs:", summary)
+        self.assertIn("Risk skips:", summary)
+        self.assertIn("Session PnL:", summary)
+
+    def test_risk_skip_summary_shows_none_when_empty(self) -> None:
+        summary = format_enhanced_backtest_summary(
+            _realism_report(),
+            Path("logs/enhanced_backtest"),
+            mode="realism",
+            realism=_realism_config(),
+        )
+
+        self.assertIn("Risk skips:", summary)
+        self.assertIn("- None", summary)
+
+    def test_risk_skip_summary_shows_reason_counts(self) -> None:
+        summary = format_enhanced_backtest_summary(
+            _risk_skip_report(),
+            Path("logs/enhanced_backtest"),
+            mode="realism",
+            realism=_realism_config(),
+        )
+
+        self.assertIn("cooldown active: 1", summary)
 
     def test_summary_has_output_directory(self) -> None:
         summary = format_enhanced_backtest_summary(_report(), Path("logs/enhanced_backtest"))
 
         self.assertIn("Output directory: logs", summary)
 
-    def test_summary_has_no_order_sent(self) -> None:
-        summary = format_enhanced_backtest_summary(_report(), Path("logs/enhanced_backtest"))
+    def test_all_summary_modes_have_safety_text_and_output_directory(self) -> None:
+        mode_cases = (
+            ("decision", _report(), None),
+            ("simulation", _realism_report(), None),
+            ("realism", _realism_report(), _realism_config()),
+        )
+        for mode, report, realism in mode_cases:
+            with self.subTest(mode=mode):
+                summary = format_enhanced_backtest_summary(
+                    report,
+                    Path("logs/enhanced_backtest"),
+                    mode=mode,
+                    realism=realism,
+                )
 
-        self.assertIn("No order was sent.", summary)
-
-    def test_summary_has_no_mt5_order_intent_written(self) -> None:
-        summary = format_enhanced_backtest_summary(_report(), Path("logs/enhanced_backtest"))
-
-        self.assertIn("No MT5 order intent was written.", summary)
-
-    def test_summary_has_offline_backtest_only(self) -> None:
-        summary = format_enhanced_backtest_summary(_report(), Path("logs/enhanced_backtest"))
-
-        self.assertIn("Offline backtest only.", summary)
+                self.assertIn("No order was sent.", summary)
+                self.assertIn("No MT5 order intent was written.", summary)
+                self.assertIn("Offline backtest only.", summary)
+                self.assertIn("Output directory", summary)
 
     def test_main_returns_zero_and_exports_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -190,6 +401,37 @@ class EnhancedBacktestMainTest(unittest.TestCase):
         self.assertEqual(decision_runner.call_count, 0)
         self.assertEqual(simulation_runner.call_count, 1)
 
+    def test_main_realism_mode_calls_realism_runner_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "enhanced"
+            with patch.dict(
+                os.environ,
+                {"ENHANCED_BACKTEST_OUTPUT_DIR": str(output_dir), "ENHANCED_BACKTEST_MODE": "realism"},
+                clear=True,
+            ):
+                with patch("trading_signal_bot.enhanced_backtest_main.load_env_file"):
+                    with patch("trading_signal_bot.enhanced_backtest_main.load_signal_config", return_value=_signal_config()):
+                        with patch("trading_signal_bot.enhanced_backtest_main.load_timeframe_candles", return_value={"M1": _candles()}):
+                            with patch(
+                                "trading_signal_bot.enhanced_backtest_main.run_enhanced_backtest_report",
+                                return_value=_report(),
+                            ) as decision_runner:
+                                with patch(
+                                    "trading_signal_bot.enhanced_backtest_main.run_enhanced_backtest_report_with_simulation",
+                                    return_value=_report(),
+                                ) as simulation_runner:
+                                    with patch(
+                                        "trading_signal_bot.enhanced_backtest_main.run_enhanced_backtest_report_with_realism",
+                                        return_value=_realism_report(),
+                                    ) as realism_runner:
+                                        with redirect_stdout(StringIO()):
+                                            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(decision_runner.call_count, 0)
+        self.assertEqual(simulation_runner.call_count, 0)
+        self.assertEqual(realism_runner.call_count, 1)
+
     def test_main_returns_one_on_runtime_error(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             with patch("trading_signal_bot.enhanced_backtest_main.load_env_file"):
@@ -232,6 +474,9 @@ class EnhancedBacktestMainTest(unittest.TestCase):
 
     def test_source_has_no_trading_signal_order(self) -> None:
         self.assertNotIn("trading_signal_order", _source_text())
+
+    def test_source_has_no_auto_trade_order_file_env(self) -> None:
+        self.assertNotIn("AUTO_TRADE_ORDER_FILE", _source_text())
 
     def test_does_not_call_legacy_backtest_main(self) -> None:
         source = _source_text()
@@ -311,6 +556,98 @@ def _report() -> BacktestReport:
         reject_reason_summary={"Spread is above maximum allowed": 1},
         skip_reason_summary={"insufficient candles": 1},
         stopped_reason=None,
+    )
+
+
+def _realism_report() -> BacktestReport:
+    metrics = BacktestMetrics(
+        total_trades=1,
+        approved_trades=1,
+        rejected_trades=0,
+        skipped_trades=0,
+        win_rate=100.0,
+        loss_rate=0.0,
+        profit_factor=1.5,
+        max_drawdown=0.0,
+        average_win=1.5,
+        average_loss=0.0,
+        average_rr=1.5,
+        max_consecutive_losses=0,
+        net_r=1.5,
+    )
+    trade = BacktestTradeResult(
+        action=SignalAction.BUY,
+        session="Asia",
+        entry_time="2026-05-18T00:00:00+00:00",
+        exit_time="2026-05-18T00:01:00+00:00",
+        entry=100.0,
+        stop_loss=99.0,
+        tp1=None,
+        tp2=101.5,
+        result="WIN",
+        r_multiple=1.5,
+        risk_reward=1.5,
+        volume=1.0,
+        pnl=118.0,
+        balance_after=10118.0,
+        loss_reason=None,
+    )
+    return BacktestReport(
+        trades=(trade,),
+        decisions=(_decision("Asia", "signal_candidate", True, ()),),
+        metrics=metrics,
+        session_metrics={"Asia": metrics, "London": metrics, "NewYork": metrics, "Other": metrics},
+        reject_reason_summary={},
+        skip_reason_summary={},
+        stopped_reason=None,
+    )
+
+
+def _risk_skip_report() -> BacktestReport:
+    metrics = BacktestMetrics(
+        total_trades=0,
+        approved_trades=0,
+        rejected_trades=0,
+        skipped_trades=1,
+        win_rate=0.0,
+        loss_rate=0.0,
+        profit_factor=0.0,
+        max_drawdown=0.0,
+        average_win=0.0,
+        average_loss=0.0,
+        average_rr=0.0,
+        max_consecutive_losses=0,
+        net_r=0.0,
+    )
+    return BacktestReport(
+        trades=(),
+        decisions=(
+            _decision("London", "risk_skip", False, ("cooldown active",)),
+        ),
+        metrics=metrics,
+        session_metrics={"Asia": metrics, "London": metrics, "NewYork": metrics, "Other": metrics},
+        reject_reason_summary={},
+        skip_reason_summary={"cooldown active": 1},
+        stopped_reason=None,
+    )
+
+
+def _realism_config() -> BacktestRealismConfig:
+    return BacktestRealismConfig(
+        initial_balance=10000.0,
+        risk_percent=1.0,
+        contract_size=100.0,
+        min_volume=0.01,
+        max_volume=10.0,
+        volume_step=0.01,
+        allow_min_volume=True,
+        spread_points=20.0,
+        point_value=0.01,
+        slippage_points=5.0,
+        commission_per_lot=7.0,
+        max_daily_loss_percent=3.0,
+        max_consecutive_losses=3,
+        cooldown_minutes=30,
     )
 
 

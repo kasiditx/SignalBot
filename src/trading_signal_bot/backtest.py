@@ -19,6 +19,12 @@ from .time_utils import parse_candle_timestamp
 
 
 LOGGER = logging.getLogger(__name__)
+_RISK_SKIP_REASONS = (
+    "cooldown active",
+    "daily risk stopped for day",
+    "max daily loss reached",
+    "max consecutive losses reached",
+)
 
 
 @dataclass(frozen=True)
@@ -523,6 +529,113 @@ def apply_backtest_money_result(
     )
 
 
+def reset_backtest_daily_risk_state(
+    current_time: datetime,
+) -> BacktestDailyRiskState:
+    return BacktestDailyRiskState(
+        date=current_time.date().isoformat(),
+        trades_today=0,
+        losses_today=0,
+        consecutive_losses=0,
+        realized_loss_percent=0.0,
+        cooldown_until=None,
+        stopped_for_day=False,
+    )
+
+
+def reset_daily_risk_state_if_new_day(
+    state: BacktestDailyRiskState,
+    current_time: datetime,
+) -> BacktestDailyRiskState:
+    if current_time.date().isoformat() != state.date:
+        return reset_backtest_daily_risk_state(current_time)
+    return state
+
+
+def evaluate_backtest_daily_risk_state(
+    state: BacktestDailyRiskState,
+    current_time: datetime,
+    realism: BacktestRealismConfig,
+) -> tuple[bool, tuple[str, ...]]:
+    reasons: list[str] = []
+    if state.stopped_for_day:
+        reasons.append("daily risk stopped for day")
+    if state.realized_loss_percent >= realism.max_daily_loss_percent:
+        reasons.append("max daily loss reached")
+    if state.consecutive_losses >= realism.max_consecutive_losses:
+        reasons.append("max consecutive losses reached")
+    if state.cooldown_until is not None and current_time < state.cooldown_until:
+        reasons.append("cooldown active")
+    return bool(reasons), tuple(reasons)
+
+
+def update_backtest_daily_risk_state_after_trade(
+    state: BacktestDailyRiskState,
+    trade: BacktestTradeResult,
+    current_time: datetime,
+    realism: BacktestRealismConfig,
+) -> BacktestDailyRiskState:
+    if trade.pnl is None:
+        raise ValueError("Trade pnl is required to update daily risk state")
+
+    trades_today = state.trades_today + 1
+    losses_today = state.losses_today
+    consecutive_losses = state.consecutive_losses
+    realized_loss_percent = state.realized_loss_percent
+    cooldown_until = state.cooldown_until
+    is_loss = trade.pnl < 0 or trade.result.startswith("LOSS")
+
+    if is_loss:
+        losses_today += 1
+        consecutive_losses += 1
+        realized_loss_percent += abs(trade.pnl) / realism.initial_balance * 100.0
+        cooldown_until = (
+            current_time + timedelta(minutes=realism.cooldown_minutes)
+            if realism.cooldown_minutes > 0
+            else None
+        )
+    else:
+        consecutive_losses = 0
+        cooldown_until = None
+
+    stopped_for_day = (
+        state.stopped_for_day
+        or realized_loss_percent >= realism.max_daily_loss_percent
+        or consecutive_losses >= realism.max_consecutive_losses
+    )
+    return BacktestDailyRiskState(
+        date=state.date,
+        trades_today=trades_today,
+        losses_today=losses_today,
+        consecutive_losses=consecutive_losses,
+        realized_loss_percent=realized_loss_percent,
+        cooldown_until=cooldown_until,
+        stopped_for_day=stopped_for_day,
+    )
+
+
+def backtest_risk_skip_decision(
+    config: SignalConfig,
+    current_time: datetime,
+    reasons: tuple[str, ...],
+) -> BacktestDecision:
+    return BacktestDecision(
+        timestamp=current_time.isoformat(),
+        session=classify_session(current_time),
+        symbol=getattr(config, "symbol", "UNKNOWN"),
+        timeframe=execution_timeframe_for_backtest(config),
+        action=None,
+        stage="risk_skip",
+        approved=False,
+        reasons=reasons,
+        htf_bias=None,
+        execution_trend=None,
+        price_location=None,
+        candle_confirmation_summary=None,
+        risk_reward=None,
+    )
+
+
 def capture_backtest_decision(
     snapshot: dict[str, list[Candle]],
     config: SignalConfig,
@@ -829,6 +942,120 @@ def run_enhanced_backtest_report_with_simulation(
     return build_backtest_report_from_decisions(tuple(decisions), tuple(trades))
 
 
+def run_enhanced_backtest_report_with_realism(
+    candles_by_timeframe: dict[str, list[Candle]],
+    config: SignalConfig,
+    realism: BacktestRealismConfig,
+    backtest_range: BacktestRange | None = None,
+    money_config: BacktestMoneyConfig | None = None,
+) -> BacktestReport:
+    del money_config
+    execution_timeframe = execution_timeframe_for_backtest(config)
+    execution = candles_by_timeframe.get(execution_timeframe)
+    if not execution:
+        return build_backtest_report_from_decisions(
+            (
+                _backtest_decision_without_signal(
+                    config=config,
+                    current_time=datetime.now(),
+                    stage="market_data",
+                    approved=False,
+                    reasons=("missing execution timeframe candles",),
+                ),
+            )
+        )
+
+    execution_timestamps = [parse_candle_timestamp(candle.timestamp) for candle in execution]
+    cursors = _build_cursors(candles_by_timeframe)
+    decisions: list[BacktestDecision] = []
+    trades: list[BacktestTradeResult] = []
+    balance = realism.initial_balance
+    index = max(0, getattr(config, "min_candles", 60) - 1)
+    risk_state = reset_backtest_daily_risk_state(execution_timestamps[index])
+    snapshot_max_bars = max(getattr(config, "min_candles", 60) + 40, 160)
+
+    while index < len(execution):
+        current_time = execution_timestamps[index]
+        if backtest_range and not _is_in_backtest_range(current_time, backtest_range):
+            index += 1
+            continue
+
+        risk_state = reset_daily_risk_state_if_new_day(risk_state, current_time)
+        should_skip, risk_reasons = evaluate_backtest_daily_risk_state(
+            risk_state,
+            current_time,
+            realism,
+        )
+        if should_skip:
+            decisions.append(
+                backtest_risk_skip_decision(
+                    config=config,
+                    current_time=current_time,
+                    reasons=risk_reasons,
+                )
+            )
+            index += 1
+            continue
+
+        snapshot = _snapshot(cursors, current_time, snapshot_max_bars)
+        decision, candidate = capture_backtest_decision_and_candidate(
+            snapshot=snapshot,
+            config=config,
+            current_time=current_time,
+            signal_index=index,
+        )
+        decisions.append(decision)
+
+        if candidate is None:
+            index += 1
+            continue
+
+        try:
+            raw_trade = simulate_enhanced_trade(candidate, execution)
+        except ValueError as exc:
+            decisions.append(
+                _backtest_decision_without_signal(
+                    config=config,
+                    current_time=current_time,
+                    stage="simulation_error",
+                    approved=False,
+                    reasons=(str(exc),),
+                )
+            )
+            index += 1
+            continue
+
+        try:
+            money_trade = apply_backtest_money_result(raw_trade, balance, realism)
+            if money_trade.balance_after is None:
+                raise ValueError("Realism trade result is missing balance_after")
+        except ValueError as exc:
+            decisions.append(
+                _backtest_decision_without_signal(
+                    config=config,
+                    current_time=current_time,
+                    stage="realism_error",
+                    approved=False,
+                    reasons=(str(exc),),
+                )
+            )
+            index += 1
+            continue
+
+        trades.append(money_trade)
+        balance = money_trade.balance_after
+        exit_time = parse_candle_timestamp(money_trade.exit_time)
+        risk_state = update_backtest_daily_risk_state_after_trade(
+            state=risk_state,
+            trade=money_trade,
+            current_time=exit_time,
+            realism=realism,
+        )
+        index = _index_after_time(execution, money_trade.exit_time, index + 1)
+
+    return build_backtest_report_from_decisions(tuple(decisions), tuple(trades))
+
+
 def classify_session(timestamp: datetime) -> str:
     hour = timestamp.hour
     if 0 <= hour < 7:
@@ -894,6 +1121,111 @@ def calculate_session_metrics(
             [decision for decision in decisions if decision.session == session],
         )
         for session in sessions
+    }
+
+
+def summarize_balance_performance(
+    report: BacktestReport,
+    initial_balance: float,
+) -> dict[str, float]:
+    if initial_balance <= 0:
+        raise ValueError("Initial balance must be greater than zero")
+
+    balances = [trade.balance_after for trade in report.trades if trade.balance_after is not None]
+    final_balance = balances[-1] if balances else initial_balance
+    net_pnl = final_balance - initial_balance
+    return {
+        "initial_balance": initial_balance,
+        "final_balance": final_balance,
+        "net_pnl": net_pnl,
+        "return_percent": (net_pnl / initial_balance) * 100.0,
+        "max_drawdown": report.metrics.max_drawdown,
+    }
+
+
+def summarize_trade_performance(
+    report: BacktestReport,
+) -> dict[str, float | int]:
+    wins = [trade for trade in report.trades if trade.result == "WIN"]
+    losses = [trade for trade in report.trades if trade.result == "LOSS"]
+    loss_both_hit = [trade for trade in report.trades if trade.result == "LOSS_BOTH_HIT"]
+    open_at_end = [trade for trade in report.trades if trade.result == "OPEN_AT_END"]
+    closed_losses = losses + loss_both_hit
+    closed = wins + closed_losses
+    return {
+        "total_trades": len(report.trades),
+        "wins": len(wins),
+        "losses": len(losses),
+        "open_at_end": len(open_at_end),
+        "loss_both_hit": len(loss_both_hit),
+        "win_rate": (len(wins) / len(closed) * 100.0) if closed else 0.0,
+        "profit_factor": report.metrics.profit_factor,
+        "net_r": report.metrics.net_r,
+        "average_win": report.metrics.average_win,
+        "average_loss": report.metrics.average_loss,
+        "average_rr": report.metrics.average_rr,
+    }
+
+
+def summarize_risk_skips(
+    report: BacktestReport,
+) -> dict[str, int]:
+    risk_reasons = {
+        "cooldown active",
+        "daily risk stopped for day",
+        "max daily loss reached",
+        "max consecutive losses reached",
+    }
+    return {
+        reason: count
+        for reason, count in report.skip_reason_summary.items()
+        if reason in risk_reasons
+    }
+
+
+def calculate_session_pnl_summary(
+    trades: tuple[BacktestTradeResult, ...],
+) -> dict[str, dict[str, float | int]]:
+    summary: dict[str, dict[str, float | int]] = {}
+    for session in ("Asia", "London", "NewYork", "Other"):
+        session_trades = [trade for trade in trades if trade.session == session]
+        wins = [trade for trade in session_trades if trade.result == "WIN"]
+        losses = [trade for trade in session_trades if trade.result.startswith("LOSS")]
+        closed = wins + losses
+        pnl_values = [trade.pnl for trade in session_trades if trade.pnl is not None]
+        summary[session] = {
+            "trades": len(session_trades),
+            "wins": len(wins),
+            "losses": len(losses),
+            "net_pnl": sum(pnl_values),
+            "average_pnl": _average(pnl_values),
+            "win_rate": (len(wins) / len(closed) * 100.0) if closed else 0.0,
+            "net_r": sum(trade.r_multiple for trade in session_trades),
+        }
+    return summary
+
+
+def calculate_backtest_cost_summary(
+    trades: tuple[BacktestTradeResult, ...],
+    realism: BacktestRealismConfig,
+) -> dict[str, float]:
+    total_commission = 0.0
+    total_spread_cost = 0.0
+    total_slippage_cost = 0.0
+    total_cost = 0.0
+    for trade in trades:
+        if trade.volume is None:
+            continue
+        costs = calculate_backtest_trade_costs(trade.volume, realism)
+        total_commission += costs["commission"]
+        total_spread_cost += costs["spread_cost"]
+        total_slippage_cost += costs["slippage_cost"]
+        total_cost += costs["total_cost"]
+    return {
+        "total_commission": total_commission,
+        "total_spread_cost": total_spread_cost,
+        "total_slippage_cost": total_slippage_cost,
+        "total_cost": total_cost,
     }
 
 
@@ -1046,6 +1378,162 @@ def export_backtest_report(
     export_backtest_decisions_csv(report, output_dir / "backtest_decisions.csv")
     export_backtest_session_summary_csv(report, output_dir / "backtest_session_summary.csv")
     export_backtest_summary_json(report, output_dir / "backtest_summary.json")
+
+
+def export_backtest_realism_summary_csv(
+    report: BacktestReport,
+    path: Path,
+    realism: BacktestRealismConfig,
+) -> None:
+    fieldnames = [
+        "initial_balance",
+        "final_balance",
+        "net_pnl",
+        "return_percent",
+        "max_drawdown",
+        "total_trades",
+        "wins",
+        "losses",
+        "open_at_end",
+        "loss_both_hit",
+        "win_rate",
+        "profit_factor",
+        "net_r",
+        "average_win",
+        "average_loss",
+        "average_rr",
+    ]
+    balance_summary = summarize_balance_performance(report, realism.initial_balance)
+    trade_summary = summarize_trade_performance(report)
+    _write_csv_rows(
+        path,
+        fieldnames,
+        [{**balance_summary, **trade_summary}],
+    )
+
+
+def export_backtest_risk_skip_summary_csv(
+    report: BacktestReport,
+    path: Path,
+) -> None:
+    fieldnames = ["reason", "count"]
+    risk_summary = summarize_risk_skips(report)
+    _write_csv_rows(
+        path,
+        fieldnames,
+        [
+            {"reason": reason, "count": risk_summary.get(reason, 0)}
+            for reason in _RISK_SKIP_REASONS
+        ],
+    )
+
+
+def export_backtest_cost_summary_csv(
+    report: BacktestReport,
+    path: Path,
+    realism: BacktestRealismConfig,
+) -> None:
+    fieldnames = [
+        "total_commission",
+        "total_spread_cost",
+        "total_slippage_cost",
+        "total_cost",
+    ]
+    _write_csv_rows(
+        path,
+        fieldnames,
+        [calculate_backtest_cost_summary(report.trades, realism)],
+    )
+
+
+def export_backtest_session_pnl_summary_csv(
+    report: BacktestReport,
+    path: Path,
+) -> None:
+    fieldnames = [
+        "session",
+        "trades",
+        "wins",
+        "losses",
+        "net_pnl",
+        "average_pnl",
+        "win_rate",
+        "net_r",
+    ]
+    session_summary = calculate_session_pnl_summary(report.trades)
+    _write_csv_rows(
+        path,
+        fieldnames,
+        [
+            {"session": session, **session_summary[session]}
+            for session in ("Asia", "London", "NewYork", "Other")
+        ],
+    )
+
+
+def export_enhanced_backtest_summary_json(
+    report: BacktestReport,
+    path: Path,
+    realism: BacktestRealismConfig | None = None,
+    mode: str | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, object] = {
+        "metrics": _metrics_to_dict(report.metrics),
+        "session_metrics": {
+            session: _metrics_to_dict(metrics)
+            for session, metrics in report.session_metrics.items()
+        },
+        "reject_reason_summary": report.reject_reason_summary,
+        "skip_reason_summary": report.skip_reason_summary,
+        "stopped_reason": report.stopped_reason,
+        "mode": mode,
+        "trade_performance": summarize_trade_performance(report),
+        "risk_skip_summary": summarize_risk_skips(report),
+        "session_pnl_summary": calculate_session_pnl_summary(report.trades),
+    }
+    if realism is not None:
+        payload["balance_performance"] = summarize_balance_performance(
+            report,
+            realism.initial_balance,
+        )
+        payload["cost_summary"] = calculate_backtest_cost_summary(report.trades, realism)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def export_enhanced_backtest_summary_files(
+    report: BacktestReport,
+    output_dir: Path,
+    realism: BacktestRealismConfig | None = None,
+    mode: str | None = None,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    export_enhanced_backtest_summary_json(
+        report,
+        output_dir / "enhanced_backtest_summary.json",
+        realism=realism,
+        mode=mode,
+    )
+    export_backtest_risk_skip_summary_csv(
+        report,
+        output_dir / "backtest_risk_skip_summary.csv",
+    )
+    export_backtest_session_pnl_summary_csv(
+        report,
+        output_dir / "backtest_session_pnl_summary.csv",
+    )
+    if realism is None:
+        return
+    export_backtest_realism_summary_csv(
+        report,
+        output_dir / "backtest_realism_summary.csv",
+        realism,
+    )
+    export_backtest_cost_summary_csv(
+        report,
+        output_dir / "backtest_cost_summary.csv",
+        realism,
+    )
 
 
 def _load_backtest_range(execution: list[Candle]) -> BacktestRange:
@@ -1539,7 +2027,7 @@ def _is_reject_decision(decision: BacktestDecision) -> bool:
 def _is_skip_decision(decision: BacktestDecision) -> bool:
     if decision.approved:
         return False
-    return decision.stage in {"skip", "skipped", "insufficient_candles"}
+    return decision.stage in {"skip", "skipped", "insufficient_candles", "risk_skip"}
 
 
 def _summarize_decision_reasons(decisions: Iterable[BacktestDecision]) -> dict[str, int]:
