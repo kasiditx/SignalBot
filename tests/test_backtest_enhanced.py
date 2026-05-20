@@ -4,7 +4,7 @@ import csv
 import json
 import tempfile
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,15 +19,19 @@ from trading_signal_bot.backtest import (
     BacktestTradeResult,
     BacktestRange,
     apply_backtest_money_result,
+    backtest_risk_skip_decision,
     build_backtest_report_from_decisions,
     backtest_candidate_from_signal,
     calculate_backtest_position_size,
+    calculate_backtest_cost_summary,
     calculate_backtest_metrics,
     calculate_session_metrics,
     calculate_backtest_trade_costs,
+    calculate_session_pnl_summary,
     capture_backtest_decision_and_candidate,
     capture_backtest_decision,
     classify_session,
+    evaluate_backtest_daily_risk_state,
     execution_timeframe_for_backtest,
     export_backtest_decisions_csv,
     export_backtest_report,
@@ -35,13 +39,20 @@ from trading_signal_bot.backtest import (
     export_backtest_summary_json,
     export_backtest_trades_csv,
     has_required_snapshot_candles,
+    reset_backtest_daily_risk_state,
+    reset_daily_risk_state_if_new_day,
     run_backtest,
     run_backtest_decision_capture,
     run_enhanced_backtest_report_with_simulation,
+    run_enhanced_backtest_report_with_realism,
     run_enhanced_backtest_report,
     simulate_enhanced_trade,
+    summarize_balance_performance,
     summarize_reject_reasons,
     summarize_skip_reasons,
+    summarize_risk_skips,
+    summarize_trade_performance,
+    update_backtest_daily_risk_state_after_trade,
 )
 from trading_signal_bot.models import Candle, Confidence, Signal, SignalAction, SignalConfig, TradeLevels
 from trading_signal_bot.multitimeframe import EXECUTION_TIMEFRAME
@@ -1530,6 +1541,833 @@ class BacktestEnhancedTest(unittest.TestCase):
     def test_legacy_run_backtest_still_callable_after_apply_money_result(self) -> None:
         self.assertTrue(callable(run_backtest))
 
+    def test_realism_runner_returns_backtest_report(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", return_value=_signal(SignalAction.BUY)):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("buy_win")},
+                _signal_config(min_candles=1),
+                _realism_config(),
+            )
+
+        self.assertIsInstance(report, BacktestReport)
+
+    def test_realism_runner_missing_execution_candles_returns_market_data_decision(self) -> None:
+        report = run_enhanced_backtest_report_with_realism({"M5": _candles(3)}, _signal_config(min_candles=1), _realism_config())
+
+        self.assertEqual(report.trades, ())
+        self.assertEqual(report.decisions[0].stage, "market_data")
+
+    def test_realism_runner_signal_candidate_is_simulated_and_applies_money(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", return_value=_signal(SignalAction.BUY)):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("buy_win")},
+                _signal_config(min_candles=1),
+                _realism_config(),
+            )
+
+        self.assertEqual(report.decisions[0].stage, "signal_candidate")
+        self.assertEqual(report.trades[0].result, "WIN")
+        self.assertIsNotNone(report.trades[0].pnl)
+
+    def test_realism_runner_trade_has_volume(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", return_value=_signal(SignalAction.BUY)):
+            report = run_enhanced_backtest_report_with_realism({"M1": _runner_candles("buy_win")}, _signal_config(min_candles=1), _realism_config())
+
+        self.assertEqual(report.trades[0].volume, 1.0)
+
+    def test_realism_runner_trade_has_pnl(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", return_value=_signal(SignalAction.BUY)):
+            report = run_enhanced_backtest_report_with_realism({"M1": _runner_candles("buy_win")}, _signal_config(min_candles=1), _realism_config())
+
+        self.assertEqual(report.trades[0].pnl, 118.0)
+
+    def test_realism_runner_trade_has_balance_after(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", return_value=_signal(SignalAction.BUY)):
+            report = run_enhanced_backtest_report_with_realism({"M1": _runner_candles("buy_win")}, _signal_config(min_candles=1), _realism_config())
+
+        self.assertEqual(report.trades[0].balance_after, 10118.0)
+
+    def test_realism_runner_second_trade_uses_first_balance_after(self) -> None:
+        signals = [_signal(SignalAction.BUY), _signal(SignalAction.BUY)]
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=signals):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("two_buy_wins", count=4)},
+                _signal_config(min_candles=1),
+                _realism_config(),
+            )
+
+        self.assertEqual(len(report.trades), 2)
+        self.assertEqual(report.trades[0].balance_after, 10118.0)
+        self.assertGreater(report.trades[1].balance_after, report.trades[0].balance_after)
+
+    def test_realism_runner_win_pnl_after_cost_is_positive(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", return_value=_signal(SignalAction.BUY)):
+            report = run_enhanced_backtest_report_with_realism({"M1": _runner_candles("buy_win")}, _signal_config(min_candles=1), _realism_config())
+
+        self.assertGreater(report.trades[0].pnl, 0)
+
+    def test_realism_runner_loss_pnl_after_cost_is_negative(self) -> None:
+        sell_signal = _signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0)
+        with patch("trading_signal_bot.backtest.generate_signal", return_value=sell_signal):
+            report = run_enhanced_backtest_report_with_realism({"M1": _runner_candles("sell_loss")}, _signal_config(min_candles=1), _realism_config())
+
+        self.assertEqual(report.trades[0].result, "LOSS")
+        self.assertLess(report.trades[0].pnl, 0)
+
+    def test_realism_runner_loss_both_hit_keeps_negative_pnl(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", return_value=_signal(SignalAction.BUY)):
+            report = run_enhanced_backtest_report_with_realism({"M1": _runner_candles("both_hit")}, _signal_config(min_candles=1), _realism_config())
+
+        self.assertEqual(report.trades[0].result, "LOSS_BOTH_HIT")
+        self.assertLess(report.trades[0].pnl, 0)
+
+    def test_realism_runner_open_at_end_uses_existing_r_multiple_for_pnl(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", return_value=_signal(SignalAction.BUY)):
+            report = run_enhanced_backtest_report_with_realism({"M1": _runner_candles("open_at_end")}, _signal_config(min_candles=1), _realism_config())
+
+        self.assertEqual(report.trades[0].result, "OPEN_AT_END")
+        self.assertAlmostEqual(report.trades[0].r_multiple, 0.6)
+        self.assertAlmostEqual(report.trades[0].pnl, 28.0)
+
+    def test_realism_runner_metrics_total_trades_updates(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", return_value=_signal(SignalAction.BUY)):
+            report = run_enhanced_backtest_report_with_realism({"M1": _runner_candles("buy_win")}, _signal_config(min_candles=1), _realism_config())
+
+        self.assertGreater(report.metrics.total_trades, 0)
+
+    def test_realism_runner_metrics_max_drawdown_uses_balance_after(self) -> None:
+        signals = [_signal(SignalAction.BUY), _signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0)]
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=signals):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("win_then_sell_loss", count=4)},
+                _signal_config(min_candles=1),
+                _realism_config(),
+            )
+
+        self.assertGreater(report.metrics.max_drawdown, 0)
+
+    def test_realism_runner_session_metrics_include_realism_trade(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", return_value=_signal(SignalAction.BUY)):
+            report = run_enhanced_backtest_report_with_realism({"M1": _runner_candles("buy_win")}, _signal_config(min_candles=1), _realism_config())
+
+        self.assertGreater(report.session_metrics["Asia"].total_trades, 0)
+
+    def test_realism_runner_records_realism_error_decision(self) -> None:
+        realism = _realism_config(initial_balance=0.0)
+        with patch("trading_signal_bot.backtest.generate_signal", return_value=_signal(SignalAction.BUY)):
+            report = run_enhanced_backtest_report_with_realism({"M1": _runner_candles("buy_win")}, _signal_config(min_candles=1), realism)
+
+        self.assertEqual(report.trades, ())
+        self.assertIn("realism_error", [decision.stage for decision in report.decisions])
+
+    def test_realism_runner_records_simulation_error_decision(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", return_value=_signal(SignalAction.BUY, stop_loss=100.0)):
+            report = run_enhanced_backtest_report_with_realism({"M1": _runner_candles("buy_win")}, _signal_config(min_candles=1), _realism_config())
+
+        self.assertEqual(report.trades, ())
+        self.assertIn("simulation_error", [decision.stage for decision in report.decisions])
+
+    def test_simulation_runner_behavior_unchanged_after_realism_runner(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", return_value=_signal(SignalAction.BUY)):
+            report = run_enhanced_backtest_report_with_simulation({"M1": _runner_candles("buy_win")}, _signal_config(min_candles=1))
+
+        self.assertIsNone(report.trades[0].pnl)
+        self.assertIsNone(report.trades[0].balance_after)
+
+    def test_decision_only_runner_behavior_unchanged_after_realism_runner(self) -> None:
+        with patch("trading_signal_bot.backtest.run_backtest_decision_capture", return_value=tuple(_sample_decisions())):
+            report = run_enhanced_backtest_report({"M1": _candles(3)}, _signal_config(min_candles=1))
+
+        self.assertEqual(report.trades, ())
+
+    def test_legacy_run_backtest_still_callable_after_realism_runner(self) -> None:
+        self.assertTrue(callable(run_backtest))
+
+    def test_realism_runner_does_not_create_root_order_intent_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            with patch("trading_signal_bot.backtest.generate_signal", return_value=_signal(SignalAction.BUY)):
+                run_enhanced_backtest_report_with_realism({"M1": _runner_candles("buy_win")}, _signal_config(min_candles=1), _realism_config())
+
+            self.assertFalse((base / "trading_signal_order.csv").exists())
+
+    def test_realism_runner_does_not_create_logs_order_intent_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            with patch("trading_signal_bot.backtest.generate_signal", return_value=_signal(SignalAction.BUY)):
+                run_enhanced_backtest_report_with_realism({"M1": _runner_candles("buy_win")}, _signal_config(min_candles=1), _realism_config())
+
+            self.assertFalse((base / "logs" / "trading_signal_order.csv").exists())
+
+    def test_backtest_module_does_not_import_auto_trade_for_realism_runner(self) -> None:
+        self.assertNotIn("auto_trade", Path("src/trading_signal_bot/backtest.py").read_text(encoding="utf-8"))
+
+    def test_reset_daily_risk_state_uses_current_date(self) -> None:
+        state = reset_backtest_daily_risk_state(_dt(7))
+
+        self.assertEqual(state.date, "2026-05-18")
+
+    def test_reset_daily_risk_state_starts_with_zero_values(self) -> None:
+        state = reset_backtest_daily_risk_state(_dt(7))
+
+        self.assertEqual(state.trades_today, 0)
+        self.assertEqual(state.losses_today, 0)
+        self.assertEqual(state.consecutive_losses, 0)
+        self.assertEqual(state.realized_loss_percent, 0.0)
+        self.assertIsNone(state.cooldown_until)
+        self.assertFalse(state.stopped_for_day)
+
+    def test_reset_daily_risk_state_if_same_day_returns_existing_state(self) -> None:
+        state = _daily_state(date="2026-05-18", trades_today=2)
+
+        result = reset_daily_risk_state_if_new_day(state, _dt(9))
+
+        self.assertIs(result, state)
+
+    def test_reset_daily_risk_state_if_new_day_resets_state(self) -> None:
+        state = _daily_state(date="2026-05-17", trades_today=2, losses_today=2, stopped_for_day=True)
+
+        result = reset_daily_risk_state_if_new_day(state, _dt(9))
+
+        self.assertEqual(result.date, "2026-05-18")
+        self.assertEqual(result.trades_today, 0)
+        self.assertEqual(result.losses_today, 0)
+
+    def test_new_day_reset_clears_cooldown(self) -> None:
+        state = _daily_state(date="2026-05-17", cooldown_until=_dt(8))
+
+        result = reset_daily_risk_state_if_new_day(state, _dt(9))
+
+        self.assertIsNone(result.cooldown_until)
+
+    def test_new_day_reset_clears_stopped_for_day(self) -> None:
+        state = _daily_state(date="2026-05-17", stopped_for_day=True)
+
+        result = reset_daily_risk_state_if_new_day(state, _dt(9))
+
+        self.assertFalse(result.stopped_for_day)
+
+    def test_evaluate_daily_risk_stopped_for_day_skips(self) -> None:
+        should_skip, reasons = evaluate_backtest_daily_risk_state(_daily_state(stopped_for_day=True), _dt(7), _realism_config())
+
+        self.assertTrue(should_skip)
+        self.assertIn("daily risk stopped for day", reasons)
+
+    def test_evaluate_daily_risk_max_daily_loss_skips(self) -> None:
+        should_skip, reasons = evaluate_backtest_daily_risk_state(_daily_state(realized_loss_percent=3.0), _dt(7), _realism_config())
+
+        self.assertTrue(should_skip)
+        self.assertIn("max daily loss reached", reasons)
+
+    def test_evaluate_daily_risk_max_consecutive_losses_skips(self) -> None:
+        should_skip, reasons = evaluate_backtest_daily_risk_state(_daily_state(consecutive_losses=3), _dt(7), _realism_config())
+
+        self.assertTrue(should_skip)
+        self.assertIn("max consecutive losses reached", reasons)
+
+    def test_evaluate_daily_risk_active_cooldown_skips(self) -> None:
+        should_skip, reasons = evaluate_backtest_daily_risk_state(_daily_state(cooldown_until=_dt(8)), _dt(7), _realism_config())
+
+        self.assertTrue(should_skip)
+        self.assertIn("cooldown active", reasons)
+
+    def test_evaluate_daily_risk_without_blocks_allows_trade(self) -> None:
+        should_skip, reasons = evaluate_backtest_daily_risk_state(_daily_state(), _dt(7), _realism_config())
+
+        self.assertFalse(should_skip)
+        self.assertEqual(reasons, ())
+
+    def test_update_daily_risk_win_increments_trades_and_resets_consecutive_losses(self) -> None:
+        state = _daily_state(consecutive_losses=2)
+
+        result = update_backtest_daily_risk_state_after_trade(state, _risk_trade("WIN", 100.0), _dt(7), _realism_config())
+
+        self.assertEqual(result.trades_today, 1)
+        self.assertEqual(result.consecutive_losses, 0)
+
+    def test_update_daily_risk_win_clears_cooldown(self) -> None:
+        state = _daily_state(cooldown_until=_dt(8))
+
+        result = update_backtest_daily_risk_state_after_trade(state, _risk_trade("WIN", 100.0), _dt(7), _realism_config())
+
+        self.assertIsNone(result.cooldown_until)
+
+    def test_update_daily_risk_loss_increments_trades(self) -> None:
+        result = update_backtest_daily_risk_state_after_trade(_daily_state(), _risk_trade("LOSS", -100.0), _dt(7), _realism_config())
+
+        self.assertEqual(result.trades_today, 1)
+
+    def test_update_daily_risk_loss_increments_losses_today(self) -> None:
+        result = update_backtest_daily_risk_state_after_trade(_daily_state(), _risk_trade("LOSS", -100.0), _dt(7), _realism_config())
+
+        self.assertEqual(result.losses_today, 1)
+
+    def test_update_daily_risk_loss_increments_consecutive_losses(self) -> None:
+        result = update_backtest_daily_risk_state_after_trade(_daily_state(consecutive_losses=1), _risk_trade("LOSS", -100.0), _dt(7), _realism_config())
+
+        self.assertEqual(result.consecutive_losses, 2)
+
+    def test_update_daily_risk_loss_increments_realized_loss_percent(self) -> None:
+        result = update_backtest_daily_risk_state_after_trade(_daily_state(), _risk_trade("LOSS", -100.0), _dt(7), _realism_config())
+
+        self.assertEqual(result.realized_loss_percent, 1.0)
+
+    def test_update_daily_risk_loss_sets_cooldown(self) -> None:
+        result = update_backtest_daily_risk_state_after_trade(_daily_state(), _risk_trade("LOSS", -100.0), _dt(7), _realism_config())
+
+        self.assertEqual(result.cooldown_until, _dt(7) + timedelta(minutes=30))
+
+    def test_update_daily_risk_zero_cooldown_does_not_set_cooldown(self) -> None:
+        result = update_backtest_daily_risk_state_after_trade(
+            _daily_state(),
+            _risk_trade("LOSS", -100.0),
+            _dt(7),
+            _realism_config(cooldown_minutes=0),
+        )
+
+        self.assertIsNone(result.cooldown_until)
+
+    def test_update_daily_risk_loss_both_hit_counts_as_loss(self) -> None:
+        result = update_backtest_daily_risk_state_after_trade(_daily_state(), _risk_trade("LOSS_BOTH_HIT", -100.0), _dt(7), _realism_config())
+
+        self.assertEqual(result.losses_today, 1)
+        self.assertEqual(result.consecutive_losses, 1)
+
+    def test_update_daily_risk_negative_pnl_counts_as_loss_even_if_result_not_loss(self) -> None:
+        result = update_backtest_daily_risk_state_after_trade(_daily_state(), _risk_trade("OPEN_AT_END", -25.0), _dt(7), _realism_config())
+
+        self.assertEqual(result.losses_today, 1)
+
+    def test_update_daily_risk_requires_pnl(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Trade pnl is required"):
+            update_backtest_daily_risk_state_after_trade(_daily_state(), _risk_trade("WIN", None), _dt(7), _realism_config())
+
+    def test_update_daily_risk_daily_loss_limit_stops_for_day(self) -> None:
+        result = update_backtest_daily_risk_state_after_trade(_daily_state(realized_loss_percent=2.5), _risk_trade("LOSS", -50.0), _dt(7), _realism_config())
+
+        self.assertTrue(result.stopped_for_day)
+
+    def test_update_daily_risk_consecutive_loss_limit_stops_for_day(self) -> None:
+        result = update_backtest_daily_risk_state_after_trade(_daily_state(consecutive_losses=2), _risk_trade("LOSS", -50.0), _dt(7), _realism_config())
+
+        self.assertTrue(result.stopped_for_day)
+
+    def test_backtest_risk_skip_decision_stage_is_risk_skip(self) -> None:
+        decision = backtest_risk_skip_decision(_signal_config(), _dt(7), ("cooldown active",))
+
+        self.assertEqual(decision.stage, "risk_skip")
+
+    def test_backtest_risk_skip_decision_is_not_approved(self) -> None:
+        decision = backtest_risk_skip_decision(_signal_config(), _dt(7), ("cooldown active",))
+
+        self.assertFalse(decision.approved)
+
+    def test_backtest_risk_skip_decision_action_is_none(self) -> None:
+        decision = backtest_risk_skip_decision(_signal_config(), _dt(7), ("cooldown active",))
+
+        self.assertIsNone(decision.action)
+
+    def test_backtest_risk_skip_decision_keeps_reasons(self) -> None:
+        decision = backtest_risk_skip_decision(_signal_config(), _dt(7), ("cooldown active",))
+
+        self.assertEqual(decision.reasons, ("cooldown active",))
+
+    def test_backtest_risk_skip_decision_uses_session(self) -> None:
+        decision = backtest_risk_skip_decision(_signal_config(), _dt(14), ("cooldown active",))
+
+        self.assertEqual(decision.session, "NewYork")
+
+    def test_backtest_risk_skip_decision_uses_execution_timeframe(self) -> None:
+        decision = backtest_risk_skip_decision(_signal_config(), _dt(7), ("cooldown active",))
+
+        self.assertEqual(decision.timeframe, "M1")
+
+    def test_risk_skip_counts_as_skip_decision_in_metrics(self) -> None:
+        decision = backtest_risk_skip_decision(_signal_config(), _dt(7), ("cooldown active",))
+
+        metrics = calculate_backtest_metrics([], [decision])
+
+        self.assertEqual(metrics.skipped_trades, 1)
+
+    def test_summarize_skip_reasons_counts_risk_skip_reason(self) -> None:
+        decision = backtest_risk_skip_decision(_signal_config(), _dt(7), ("cooldown active",))
+
+        summary = summarize_skip_reasons([decision])
+
+        self.assertEqual(summary["cooldown active"], 1)
+
+    def test_legacy_run_backtest_still_callable_after_daily_risk_helpers(self) -> None:
+        self.assertTrue(callable(run_backtest))
+
+    def test_daily_risk_helpers_do_not_create_root_order_intent_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+
+            update_backtest_daily_risk_state_after_trade(_daily_state(), _risk_trade("LOSS", -100.0), _dt(7), _realism_config())
+
+            self.assertFalse((base / "trading_signal_order.csv").exists())
+
+    def test_daily_risk_helpers_do_not_create_logs_order_intent_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+
+            update_backtest_daily_risk_state_after_trade(_daily_state(), _risk_trade("LOSS", -100.0), _dt(7), _realism_config())
+
+            self.assertFalse((base / "logs" / "trading_signal_order.csv").exists())
+
+    def test_realism_runner_creates_risk_skip_when_cooldown_active(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=[_signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0)]):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("sell_loss_then_wait", count=3)},
+                _signal_config(min_candles=1),
+                _realism_config(),
+            )
+
+        self.assertIn("risk_skip", [decision.stage for decision in report.decisions])
+        self.assertIn("cooldown active", report.skip_reason_summary)
+
+    def test_realism_runner_risk_skip_does_not_create_trade(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=[_signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0)]):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("sell_loss_then_wait", count=3)},
+                _signal_config(min_candles=1),
+                _realism_config(),
+            )
+
+        self.assertEqual(len(report.trades), 1)
+        self.assertEqual(report.metrics.skipped_trades, 1)
+
+    def test_realism_runner_max_daily_loss_creates_risk_skip(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=[_signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0)]):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("sell_loss_then_wait", count=3)},
+                _signal_config(min_candles=1),
+                _realism_config(max_daily_loss_percent=1.0, cooldown_minutes=0, max_consecutive_losses=99),
+            )
+
+        self.assertIn("max daily loss reached", report.skip_reason_summary)
+
+    def test_realism_runner_max_consecutive_losses_creates_risk_skip(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=[_signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0)]):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("sell_loss_then_wait", count=3)},
+                _signal_config(min_candles=1),
+                _realism_config(cooldown_minutes=0, max_daily_loss_percent=99.0, max_consecutive_losses=1),
+            )
+
+        self.assertIn("max consecutive losses reached", report.skip_reason_summary)
+
+    def test_realism_runner_daily_reset_allows_next_day_trade(self) -> None:
+        signals = [
+            _signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0),
+            _signal(SignalAction.BUY),
+        ]
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=signals):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _risk_runner_candles_across_days()},
+                _signal_config(min_candles=1),
+                _realism_config(cooldown_minutes=60, max_daily_loss_percent=1.0, max_consecutive_losses=1),
+            )
+
+        self.assertEqual(len(report.trades), 2)
+        self.assertEqual(report.trades[0].result, "LOSS")
+        self.assertEqual(report.trades[1].result, "WIN")
+
+    def test_realism_runner_cooldown_starts_from_exit_time(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=[_signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0)]):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("sell_loss_then_wait", count=3)},
+                _signal_config(min_candles=1),
+                _realism_config(cooldown_minutes=30),
+            )
+
+        risk_skip = [decision for decision in report.decisions if decision.stage == "risk_skip"][0]
+        self.assertEqual(risk_skip.timestamp, "2026-05-18T00:02:00+00:00")
+
+    def test_realism_runner_loss_both_hit_triggers_cooldown_and_consecutive_loss(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=[_signal(SignalAction.BUY)]):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("both_hit", count=3)},
+                _signal_config(min_candles=1),
+                _realism_config(),
+            )
+
+        self.assertEqual(report.trades[0].result, "LOSS_BOTH_HIT")
+        self.assertIn("cooldown active", report.skip_reason_summary)
+
+    def test_realism_runner_negative_open_at_end_counts_as_loss(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=[_signal(SignalAction.BUY)]):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("negative_open_at_end", count=3)},
+                _signal_config(min_candles=1),
+                _realism_config(),
+            )
+
+        self.assertEqual(report.trades[0].result, "OPEN_AT_END")
+        self.assertLess(report.trades[0].pnl, 0)
+
+    def test_realism_runner_skip_reason_summary_counts_cooldown_active(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=[_signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0)]):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("sell_loss_then_wait", count=3)},
+                _signal_config(min_candles=1),
+                _realism_config(),
+            )
+
+        self.assertEqual(report.skip_reason_summary["cooldown active"], 1)
+
+    def test_realism_runner_skip_reason_summary_counts_max_daily_loss(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=[_signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0)]):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("sell_loss_then_wait", count=3)},
+                _signal_config(min_candles=1),
+                _realism_config(max_daily_loss_percent=1.0, cooldown_minutes=0, max_consecutive_losses=99),
+            )
+
+        self.assertEqual(report.skip_reason_summary["max daily loss reached"], 1)
+
+    def test_realism_runner_skip_reason_summary_counts_max_consecutive_losses(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=[_signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0)]):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("sell_loss_then_wait", count=3)},
+                _signal_config(min_candles=1),
+                _realism_config(cooldown_minutes=0, max_daily_loss_percent=99.0, max_consecutive_losses=1),
+            )
+
+        self.assertEqual(report.skip_reason_summary["max consecutive losses reached"], 1)
+
+    def test_realism_runner_metrics_skipped_trades_counts_risk_skip(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=[_signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0)]):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("sell_loss_then_wait", count=3)},
+                _signal_config(min_candles=1),
+                _realism_config(),
+            )
+
+        self.assertEqual(report.metrics.skipped_trades, 1)
+
+    def test_realism_runner_total_trades_does_not_increase_from_risk_skip(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=[_signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0)]):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("sell_loss_then_wait", count=3)},
+                _signal_config(min_candles=1),
+                _realism_config(),
+            )
+
+        self.assertEqual(report.metrics.total_trades, 1)
+
+    def test_realism_runner_risk_skip_decision_stage(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=[_signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0)]):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("sell_loss_then_wait", count=3)},
+                _signal_config(min_candles=1),
+                _realism_config(),
+            )
+
+        risk_skip = [decision for decision in report.decisions if decision.stage == "risk_skip"][0]
+        self.assertEqual(risk_skip.stage, "risk_skip")
+
+    def test_realism_runner_risk_skip_decision_not_approved(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=[_signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0)]):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("sell_loss_then_wait", count=3)},
+                _signal_config(min_candles=1),
+                _realism_config(),
+            )
+
+        risk_skip = [decision for decision in report.decisions if decision.stage == "risk_skip"][0]
+        self.assertFalse(risk_skip.approved)
+
+    def test_realism_runner_risk_skip_decision_action_none(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=[_signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0)]):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("sell_loss_then_wait", count=3)},
+                _signal_config(min_candles=1),
+                _realism_config(),
+            )
+
+        risk_skip = [decision for decision in report.decisions if decision.stage == "risk_skip"][0]
+        self.assertIsNone(risk_skip.action)
+
+    def test_realism_runner_risk_skip_decision_session_and_timeframe(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", side_effect=[_signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0)]):
+            report = run_enhanced_backtest_report_with_realism(
+                {"M1": _runner_candles("sell_loss_then_wait", count=3)},
+                _signal_config(min_candles=1),
+                _realism_config(),
+            )
+
+        risk_skip = [decision for decision in report.decisions if decision.stage == "risk_skip"][0]
+        self.assertEqual(risk_skip.session, "Asia")
+        self.assertEqual(risk_skip.timeframe, "M1")
+
+    def test_simulation_runner_still_has_no_money_fields_after_daily_risk_integration(self) -> None:
+        with patch("trading_signal_bot.backtest.generate_signal", return_value=_signal(SignalAction.BUY)):
+            report = run_enhanced_backtest_report_with_simulation({"M1": _runner_candles("buy_win")}, _signal_config(min_candles=1))
+
+        self.assertIsNone(report.trades[0].pnl)
+        self.assertIsNone(report.trades[0].balance_after)
+
+    def test_decision_only_runner_still_has_no_trades_after_daily_risk_integration(self) -> None:
+        with patch("trading_signal_bot.backtest.run_backtest_decision_capture", return_value=tuple(_sample_decisions())):
+            report = run_enhanced_backtest_report({"M1": _candles(3)}, _signal_config(min_candles=1))
+
+        self.assertEqual(report.trades, ())
+
+    def test_legacy_run_backtest_still_callable_after_daily_risk_runner(self) -> None:
+        self.assertTrue(callable(run_backtest))
+
+    def test_daily_risk_runner_does_not_create_root_order_intent_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            with patch("trading_signal_bot.backtest.generate_signal", side_effect=[_signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0)]):
+                run_enhanced_backtest_report_with_realism(
+                    {"M1": _runner_candles("sell_loss_then_wait", count=3)},
+                    _signal_config(min_candles=1),
+                    _realism_config(),
+                )
+
+            self.assertFalse((base / "trading_signal_order.csv").exists())
+
+    def test_daily_risk_runner_does_not_create_logs_order_intent_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            with patch("trading_signal_bot.backtest.generate_signal", side_effect=[_signal(SignalAction.SELL, stop_loss=101.0, take_profit=98.0, risk_reward=2.0)]):
+                run_enhanced_backtest_report_with_realism(
+                    {"M1": _runner_candles("sell_loss_then_wait", count=3)},
+                    _signal_config(min_candles=1),
+                    _realism_config(),
+                )
+
+            self.assertFalse((base / "logs" / "trading_signal_order.csv").exists())
+
+    def test_backtest_module_still_does_not_import_auto_trade_after_daily_risk_runner(self) -> None:
+        self.assertNotIn("auto_trade", Path("src/trading_signal_bot/backtest.py").read_text(encoding="utf-8"))
+
+    def test_balance_summary_uses_latest_balance_after_as_final_balance(self) -> None:
+        summary = summarize_balance_performance(_summary_helper_report(), 10000.0)
+
+        self.assertEqual(summary["final_balance"], 10150.0)
+
+    def test_balance_summary_without_balance_after_uses_initial_balance(self) -> None:
+        report = build_backtest_report_from_decisions((), (_trade(balance_after=None),))
+
+        summary = summarize_balance_performance(report, 10000.0)
+
+        self.assertEqual(summary["final_balance"], 10000.0)
+
+    def test_balance_summary_net_pnl(self) -> None:
+        summary = summarize_balance_performance(_summary_helper_report(), 10000.0)
+
+        self.assertEqual(summary["net_pnl"], 150.0)
+
+    def test_balance_summary_return_percent(self) -> None:
+        summary = summarize_balance_performance(_summary_helper_report(), 10000.0)
+
+        self.assertEqual(summary["return_percent"], 1.5)
+
+    def test_balance_summary_uses_metrics_max_drawdown(self) -> None:
+        summary = summarize_balance_performance(_summary_helper_report(), 10000.0)
+
+        self.assertEqual(summary["max_drawdown"], _summary_helper_report().metrics.max_drawdown)
+
+    def test_balance_summary_invalid_initial_balance_raises(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Initial balance must be greater than zero"):
+            summarize_balance_performance(_summary_helper_report(), 0.0)
+
+    def test_trade_summary_counts_total_trades(self) -> None:
+        summary = summarize_trade_performance(_summary_helper_report())
+
+        self.assertEqual(summary["total_trades"], 4)
+
+    def test_trade_summary_counts_wins(self) -> None:
+        summary = summarize_trade_performance(_summary_helper_report())
+
+        self.assertEqual(summary["wins"], 1)
+
+    def test_trade_summary_counts_losses(self) -> None:
+        summary = summarize_trade_performance(_summary_helper_report())
+
+        self.assertEqual(summary["losses"], 1)
+
+    def test_trade_summary_counts_loss_both_hit(self) -> None:
+        summary = summarize_trade_performance(_summary_helper_report())
+
+        self.assertEqual(summary["loss_both_hit"], 1)
+
+    def test_trade_summary_counts_open_at_end(self) -> None:
+        summary = summarize_trade_performance(_summary_helper_report())
+
+        self.assertEqual(summary["open_at_end"], 1)
+
+    def test_trade_summary_win_rate(self) -> None:
+        summary = summarize_trade_performance(_summary_helper_report())
+
+        self.assertAlmostEqual(summary["win_rate"], 33.33333333333333)
+
+    def test_trade_summary_uses_metrics_profit_factor(self) -> None:
+        report = _summary_helper_report()
+
+        summary = summarize_trade_performance(report)
+
+        self.assertEqual(summary["profit_factor"], report.metrics.profit_factor)
+
+    def test_trade_summary_uses_metrics_net_r(self) -> None:
+        report = _summary_helper_report()
+
+        summary = summarize_trade_performance(report)
+
+        self.assertEqual(summary["net_r"], report.metrics.net_r)
+
+    def test_trade_summary_uses_metric_averages(self) -> None:
+        report = _summary_helper_report()
+
+        summary = summarize_trade_performance(report)
+
+        self.assertEqual(summary["average_win"], report.metrics.average_win)
+        self.assertEqual(summary["average_loss"], report.metrics.average_loss)
+        self.assertEqual(summary["average_rr"], report.metrics.average_rr)
+
+    def test_risk_skip_summary_counts_cooldown_active(self) -> None:
+        summary = summarize_risk_skips(_risk_skip_summary_report())
+
+        self.assertEqual(summary["cooldown active"], 2)
+
+    def test_risk_skip_summary_counts_daily_stop(self) -> None:
+        summary = summarize_risk_skips(_risk_skip_summary_report())
+
+        self.assertEqual(summary["daily risk stopped for day"], 1)
+
+    def test_risk_skip_summary_counts_max_daily_loss(self) -> None:
+        summary = summarize_risk_skips(_risk_skip_summary_report())
+
+        self.assertEqual(summary["max daily loss reached"], 1)
+
+    def test_risk_skip_summary_counts_max_consecutive_losses(self) -> None:
+        summary = summarize_risk_skips(_risk_skip_summary_report())
+
+        self.assertEqual(summary["max consecutive losses reached"], 1)
+
+    def test_risk_skip_summary_ignores_non_risk_skip_reasons(self) -> None:
+        summary = summarize_risk_skips(_risk_skip_summary_report())
+
+        self.assertNotIn("insufficient candles", summary)
+
+    def test_risk_skip_summary_without_risk_skips_is_empty(self) -> None:
+        self.assertEqual(summarize_risk_skips(_sample_report()), {})
+
+    def test_session_pnl_summary_has_all_sessions(self) -> None:
+        summary = calculate_session_pnl_summary(tuple(_session_pnl_trades()))
+
+        self.assertEqual(set(summary), {"Asia", "London", "NewYork", "Other"})
+
+    def test_session_pnl_summary_counts_trades(self) -> None:
+        summary = calculate_session_pnl_summary(tuple(_session_pnl_trades()))
+
+        self.assertEqual(summary["Asia"]["trades"], 2)
+        self.assertEqual(summary["London"]["trades"], 1)
+
+    def test_session_pnl_summary_counts_wins_and_losses(self) -> None:
+        summary = calculate_session_pnl_summary(tuple(_session_pnl_trades()))
+
+        self.assertEqual(summary["Asia"]["wins"], 1)
+        self.assertEqual(summary["Asia"]["losses"], 1)
+
+    def test_session_pnl_summary_net_pnl(self) -> None:
+        summary = calculate_session_pnl_summary(tuple(_session_pnl_trades()))
+
+        self.assertEqual(summary["Asia"]["net_pnl"], 50.0)
+
+    def test_session_pnl_summary_average_pnl(self) -> None:
+        summary = calculate_session_pnl_summary(tuple(_session_pnl_trades()))
+
+        self.assertEqual(summary["Asia"]["average_pnl"], 25.0)
+
+    def test_session_pnl_summary_win_rate(self) -> None:
+        summary = calculate_session_pnl_summary(tuple(_session_pnl_trades()))
+
+        self.assertEqual(summary["Asia"]["win_rate"], 50.0)
+
+    def test_session_pnl_summary_net_r(self) -> None:
+        summary = calculate_session_pnl_summary(tuple(_session_pnl_trades()))
+
+        self.assertEqual(summary["Asia"]["net_r"], 0.5)
+
+    def test_session_pnl_summary_empty_session_is_zero(self) -> None:
+        summary = calculate_session_pnl_summary(tuple(_session_pnl_trades()))
+
+        self.assertEqual(summary["Other"]["trades"], 0)
+        self.assertEqual(summary["Other"]["net_pnl"], 0)
+        self.assertEqual(summary["Other"]["average_pnl"], 0.0)
+        self.assertEqual(summary["Other"]["win_rate"], 0.0)
+
+    def test_cost_summary_total_commission(self) -> None:
+        summary = calculate_backtest_cost_summary(tuple(_cost_summary_trades()), _realism_config())
+
+        self.assertEqual(summary["total_commission"], 21.0)
+
+    def test_cost_summary_total_spread_cost(self) -> None:
+        summary = calculate_backtest_cost_summary(tuple(_cost_summary_trades()), _realism_config())
+
+        self.assertEqual(summary["total_spread_cost"], 60.0)
+
+    def test_cost_summary_total_slippage_cost(self) -> None:
+        summary = calculate_backtest_cost_summary(tuple(_cost_summary_trades()), _realism_config())
+
+        self.assertEqual(summary["total_slippage_cost"], 15.0)
+
+    def test_cost_summary_total_cost(self) -> None:
+        summary = calculate_backtest_cost_summary(tuple(_cost_summary_trades()), _realism_config())
+
+        self.assertEqual(summary["total_cost"], 96.0)
+
+    def test_cost_summary_skips_trades_without_volume(self) -> None:
+        summary = calculate_backtest_cost_summary((_trade(volume=None),), _realism_config())
+
+        self.assertEqual(summary["total_cost"], 0.0)
+
+    def test_cost_summary_without_any_volume_is_zero(self) -> None:
+        summary = calculate_backtest_cost_summary((_trade(volume=None), _trade(volume=None)), _realism_config())
+
+        self.assertEqual(
+            summary,
+            {
+                "total_commission": 0.0,
+                "total_spread_cost": 0.0,
+                "total_slippage_cost": 0.0,
+                "total_cost": 0.0,
+            },
+        )
+
+    def test_legacy_run_backtest_still_callable_after_summary_helpers(self) -> None:
+        self.assertTrue(callable(run_backtest))
+
+    def test_summary_helpers_do_not_create_root_order_intent_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+
+            summarize_balance_performance(_summary_helper_report(), 10000.0)
+            calculate_backtest_cost_summary(tuple(_cost_summary_trades()), _realism_config())
+
+            self.assertFalse((base / "trading_signal_order.csv").exists())
+
+    def test_summary_helpers_do_not_create_logs_order_intent_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+
+            summarize_balance_performance(_summary_helper_report(), 10000.0)
+            calculate_backtest_cost_summary(tuple(_cost_summary_trades()), _realism_config())
+
+            self.assertFalse((base / "logs" / "trading_signal_order.csv").exists())
+
+    def test_backtest_source_has_no_auto_trade_strings_after_summary_helpers(self) -> None:
+        source = Path("src/trading_signal_bot/backtest.py").read_text(encoding="utf-8")
+
+        self.assertNotIn("auto_trade", source)
+        self.assertNotIn("process_auto_trade", source)
+        self.assertNotIn("order_file", source)
+        self.assertNotIn("trading_signal_order", source)
+
 
 def _decision(
     session: str = "London",
@@ -1561,7 +2399,11 @@ def _trade(
     r_multiple: float = 1.5,
     risk_reward: float | None = 1.5,
     balance_after: float | None = 1015.0,
+    pnl: float | None = None,
+    volume: float | None = 0.1,
 ) -> BacktestTradeResult:
+    if pnl is None and r_multiple is not None:
+        pnl = r_multiple * 10.0
     return BacktestTradeResult(
         action=action,
         session=session,
@@ -1574,8 +2416,8 @@ def _trade(
         result=result,
         r_multiple=r_multiple,
         risk_reward=risk_reward,
-        volume=0.1,
-        pnl=r_multiple * 10.0,
+        volume=volume,
+        pnl=pnl,
         balance_after=balance_after,
         loss_reason="stop_loss" if result.startswith("LOSS") else None,
     )
@@ -1627,6 +2469,50 @@ def _money_trade(
         balance_after=None,
         loss_reason="stop_loss_hit" if result.startswith("LOSS") else None,
         reject_reasons_before_entry=(),
+    )
+
+
+def _risk_trade(
+    result: str,
+    pnl: float | None,
+) -> BacktestTradeResult:
+    return BacktestTradeResult(
+        action=SignalAction.BUY,
+        session="London",
+        entry_time="2026-05-18T07:00:00Z",
+        exit_time="2026-05-18T07:05:00Z",
+        entry=100.0,
+        stop_loss=99.0,
+        tp1=None,
+        tp2=101.5,
+        result=result,
+        r_multiple=1.5 if result == "WIN" else -1.0,
+        risk_reward=1.5,
+        volume=1.0,
+        pnl=pnl,
+        balance_after=10000.0 + pnl if pnl is not None else None,
+        loss_reason="stop_loss_hit" if result.startswith("LOSS") else None,
+        reject_reasons_before_entry=(),
+    )
+
+
+def _daily_state(
+    date: str = "2026-05-18",
+    trades_today: int = 0,
+    losses_today: int = 0,
+    consecutive_losses: int = 0,
+    realized_loss_percent: float = 0.0,
+    cooldown_until: datetime | None = None,
+    stopped_for_day: bool = False,
+) -> BacktestDailyRiskState:
+    return BacktestDailyRiskState(
+        date=date,
+        trades_today=trades_today,
+        losses_today=losses_today,
+        consecutive_losses=consecutive_losses,
+        realized_loss_percent=realized_loss_percent,
+        cooldown_until=cooldown_until,
+        stopped_for_day=stopped_for_day,
     )
 
 
@@ -1688,6 +2574,28 @@ def _runner_candles(scenario: str, count: int = 3) -> list[Candle]:
             (100.0, 100.8, 99.2, 100.4),
             (100.4, 100.9, 99.4, 100.6),
         ],
+        "two_buy_wins": [
+            (100.0, 100.5, 99.5, 100.0),
+            (100.0, 102.5, 99.5, 101.5),
+            (100.0, 100.5, 99.5, 100.0),
+            (100.0, 102.5, 99.5, 101.5),
+        ],
+        "win_then_sell_loss": [
+            (100.0, 100.5, 99.5, 100.0),
+            (100.0, 102.5, 99.5, 101.5),
+            (100.0, 100.5, 99.5, 100.0),
+            (100.0, 101.5, 99.5, 101.0),
+        ],
+        "sell_loss_then_wait": [
+            (100.0, 100.5, 99.0, 100.0),
+            (100.0, 101.5, 99.5, 101.0),
+            (101.0, 101.2, 100.2, 100.8),
+        ],
+        "negative_open_at_end": [
+            (100.0, 100.5, 99.5, 100.0),
+            (100.0, 100.5, 99.2, 99.6),
+            (99.6, 100.4, 99.1, 99.5),
+        ],
     }
     values = templates[scenario]
     candles: list[Candle] = []
@@ -1704,6 +2612,26 @@ def _runner_candles(scenario: str, count: int = 3) -> list[Candle]:
             )
         )
     return candles
+
+
+def _risk_runner_candles_across_days() -> list[Candle]:
+    values = [
+        ("2026-05-18 00:00", 100.0, 100.5, 99.0, 100.0),
+        ("2026-05-18 00:01", 100.0, 101.5, 99.5, 101.0),
+        ("2026-05-19 00:00", 100.0, 100.5, 99.5, 100.0),
+        ("2026-05-19 00:01", 100.0, 102.5, 99.5, 101.5),
+    ]
+    return [
+        Candle(
+            timestamp=timestamp,
+            open=open_,
+            high=high,
+            low=low,
+            close=close,
+            volume=1000 + index,
+        )
+        for index, (timestamp, open_, high, low, close) in enumerate(values)
+    ]
 
 
 def _realism_config(
@@ -1899,6 +2827,53 @@ def _empty_report() -> BacktestReport:
         skip_reason_summary={},
         stopped_reason=None,
     )
+
+
+def _summary_helper_report() -> BacktestReport:
+    trades = (
+        _trade(session="Asia", result="WIN", r_multiple=1.5, pnl=150.0, balance_after=10150.0),
+        _trade(session="London", result="LOSS", r_multiple=-1.0, pnl=-100.0, balance_after=10050.0),
+        _trade(session="NewYork", result="LOSS_BOTH_HIT", r_multiple=-1.0, pnl=-100.0, balance_after=9950.0),
+        _trade(session="Asia", result="OPEN_AT_END", r_multiple=0.5, pnl=50.0, balance_after=10150.0),
+    )
+    decisions = tuple(_sample_decisions())
+    return build_backtest_report_from_decisions(decisions, trades)
+
+
+def _risk_skip_summary_report() -> BacktestReport:
+    metrics = calculate_backtest_metrics([], [])
+    return BacktestReport(
+        trades=(),
+        decisions=(),
+        metrics=metrics,
+        session_metrics={},
+        reject_reason_summary={},
+        skip_reason_summary={
+            "cooldown active": 2,
+            "daily risk stopped for day": 1,
+            "max daily loss reached": 1,
+            "max consecutive losses reached": 1,
+            "insufficient candles": 9,
+        },
+        stopped_reason=None,
+    )
+
+
+def _session_pnl_trades() -> list[BacktestTradeResult]:
+    return [
+        _trade(session="Asia", result="WIN", r_multiple=1.5, pnl=150.0),
+        _trade(session="Asia", result="LOSS", r_multiple=-1.0, pnl=-100.0),
+        _trade(session="London", result="LOSS_BOTH_HIT", r_multiple=-1.0, pnl=-75.0),
+        _trade(session="NewYork", result="OPEN_AT_END", r_multiple=0.25, pnl=25.0),
+    ]
+
+
+def _cost_summary_trades() -> list[BacktestTradeResult]:
+    return [
+        _trade(volume=1.0),
+        _trade(volume=2.0),
+        _trade(volume=None),
+    ]
 
 
 def _csv_rows(path: Path) -> list[dict[str, str]]:
