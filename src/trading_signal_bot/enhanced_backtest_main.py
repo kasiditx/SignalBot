@@ -12,6 +12,7 @@ from .backtest import (
     calculate_backtest_cost_summary,
     calculate_session_pnl_summary,
     export_backtest_report,
+    export_enhanced_backtest_summary_files,
     run_enhanced_backtest_report,
     run_enhanced_backtest_report_with_realism,
     run_enhanced_backtest_report_with_simulation,
@@ -267,7 +268,13 @@ def format_enhanced_backtest_summary(
         if len(risk_skip_lines) > 1 and risk_skip_lines[1] != "- None":
             lines.extend(["", *risk_skip_lines])
 
-    lines.extend(["", f"Output directory: {output_dir}"])
+    lines.extend(
+        [
+            "",
+            "Enhanced summary files: enhanced_backtest_summary.json and CSV summaries",
+            f"Output directory: {output_dir}",
+        ]
+    )
     if report.stopped_reason:
         lines.append(f"Stopped: {report.stopped_reason}")
     if not report.decisions:
@@ -324,6 +331,12 @@ def main() -> int:
                 money_config=None,
             )
         export_backtest_report(report, output_dir)
+        export_enhanced_backtest_summary_files(
+            report=report,
+            output_dir=output_dir,
+            realism=realism_config,
+            mode=mode,
+        )
         print(format_enhanced_backtest_summary(report, output_dir, mode, realism_config))
         return 0
     except Exception as exc:

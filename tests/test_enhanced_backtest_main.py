@@ -316,6 +316,11 @@ class EnhancedBacktestMainTest(unittest.TestCase):
 
         self.assertIn("Output directory: logs", summary)
 
+    def test_summary_has_enhanced_summary_files_message(self) -> None:
+        summary = format_enhanced_backtest_summary(_report(), Path("logs/enhanced_backtest"))
+
+        self.assertIn("Enhanced summary files: enhanced_backtest_summary.json and CSV summaries", summary)
+
     def test_all_summary_modes_have_safety_text_and_output_directory(self) -> None:
         mode_cases = (
             ("decision", _report(), None),
@@ -348,6 +353,9 @@ class EnhancedBacktestMainTest(unittest.TestCase):
             self.assertTrue((output_dir / "backtest_decisions.csv").exists())
             self.assertTrue((output_dir / "backtest_session_summary.csv").exists())
             self.assertTrue((output_dir / "backtest_summary.json").exists())
+            self.assertTrue((output_dir / "enhanced_backtest_summary.json").exists())
+            self.assertTrue((output_dir / "backtest_risk_skip_summary.csv").exists())
+            self.assertTrue((output_dir / "backtest_session_pnl_summary.csv").exists())
 
     def test_main_decision_mode_calls_decision_runner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -444,22 +452,95 @@ class EnhancedBacktestMainTest(unittest.TestCase):
         self.assertIn("Enhanced backtest failed", output.getvalue())
         self.assertIn("No order was sent.", output.getvalue())
 
-    def test_output_dir_has_all_four_files_after_main(self) -> None:
+    def test_decision_mode_exports_legacy_and_enhanced_base_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output_dir = Path(directory) / "enhanced"
             with _patched_success_boundaries(output_dir):
                 with redirect_stdout(StringIO()):
                     main()
 
-            self.assertEqual(
-                {path.name for path in output_dir.iterdir() if path.is_file()},
-                {
-                    "backtest_trades.csv",
-                    "backtest_decisions.csv",
-                    "backtest_session_summary.csv",
-                    "backtest_summary.json",
-                },
-            )
+            self.assertEqual(_output_file_names(output_dir), _legacy_files() | _enhanced_base_files())
+            self.assertFalse((output_dir / "backtest_realism_summary.csv").exists())
+            self.assertFalse((output_dir / "backtest_cost_summary.csv").exists())
+
+    def test_simulation_mode_exports_legacy_and_enhanced_base_files_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "enhanced"
+            with _patched_success_boundaries(output_dir, mode="simulation", report=_realism_report()):
+                with redirect_stdout(StringIO()):
+                    exit_code = main()
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(_output_file_names(output_dir), _legacy_files() | _enhanced_base_files())
+            self.assertFalse((output_dir / "backtest_realism_summary.csv").exists())
+            self.assertFalse((output_dir / "backtest_cost_summary.csv").exists())
+
+    def test_realism_mode_exports_legacy_enhanced_base_and_realism_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "enhanced"
+            with _patched_success_boundaries(output_dir, mode="realism", report=_realism_report()):
+                with redirect_stdout(StringIO()):
+                    exit_code = main()
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(_output_file_names(output_dir), _legacy_files() | _enhanced_base_files() | _realism_files())
+
+    def test_realism_mode_passes_realism_config_to_enhanced_export(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "enhanced"
+            with _patched_success_boundaries(output_dir, mode="realism", report=_realism_report()):
+                with patch(
+                    "trading_signal_bot.enhanced_backtest_main.export_enhanced_backtest_summary_files",
+                ) as enhanced_export:
+                    with redirect_stdout(StringIO()):
+                        exit_code = main()
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(enhanced_export.call_count, 1)
+            self.assertIsInstance(enhanced_export.call_args.kwargs["realism"], BacktestRealismConfig)
+            self.assertEqual(enhanced_export.call_args.kwargs["mode"], "realism")
+
+    def test_enhanced_export_failure_returns_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "enhanced"
+            with _patched_success_boundaries(output_dir):
+                with patch(
+                    "trading_signal_bot.enhanced_backtest_main.export_enhanced_backtest_summary_files",
+                    side_effect=ValueError("enhanced export failed"),
+                ):
+                    output = StringIO()
+                    with redirect_stdout(output):
+                        exit_code = main()
+
+            self.assertEqual(exit_code, 1)
+            self.assertIn("Enhanced backtest failed", output.getvalue())
+            self.assertIn("No order was sent.", output.getvalue())
+
+    def test_export_backtest_report_is_called_before_enhanced_export(self) -> None:
+        calls: list[str] = []
+
+        def legacy_export(*args, **kwargs) -> None:
+            calls.append("legacy")
+
+        def enhanced_export(*args, **kwargs) -> None:
+            calls.append("enhanced")
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "enhanced"
+            with _patched_success_boundaries(output_dir):
+                with patch(
+                    "trading_signal_bot.enhanced_backtest_main.export_backtest_report",
+                    side_effect=legacy_export,
+                ):
+                    with patch(
+                        "trading_signal_bot.enhanced_backtest_main.export_enhanced_backtest_summary_files",
+                        side_effect=enhanced_export,
+                    ):
+                        with redirect_stdout(StringIO()):
+                            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, ["legacy", "enhanced"])
 
     def test_source_ast_has_no_auto_trade_import(self) -> None:
         imports = _source_imports()
@@ -502,22 +583,37 @@ class EnhancedBacktestMainTest(unittest.TestCase):
             self.assertFalse((Path(directory) / "logs" / "trading_signal_order.csv").exists())
 
 
-def _patched_success_boundaries(output_dir: Path):
-    return _BoundaryPatches(output_dir)
+def _patched_success_boundaries(
+    output_dir: Path,
+    mode: str = "decision",
+    report: BacktestReport | None = None,
+):
+    return _BoundaryPatches(output_dir, mode, report or _report())
 
 
 class _BoundaryPatches:
-    def __init__(self, output_dir: Path) -> None:
+    def __init__(self, output_dir: Path, mode: str, report: BacktestReport) -> None:
         self.output_dir = output_dir
+        self.mode = mode
+        self.report = report
         self._patches = []
 
     def __enter__(self):
         self._patches = [
-            patch.dict(os.environ, {"ENHANCED_BACKTEST_OUTPUT_DIR": str(self.output_dir)}, clear=True),
+            patch.dict(
+                os.environ,
+                {
+                    "ENHANCED_BACKTEST_OUTPUT_DIR": str(self.output_dir),
+                    "ENHANCED_BACKTEST_MODE": self.mode,
+                },
+                clear=True,
+            ),
             patch("trading_signal_bot.enhanced_backtest_main.load_env_file"),
             patch("trading_signal_bot.enhanced_backtest_main.load_signal_config", return_value=_signal_config()),
             patch("trading_signal_bot.enhanced_backtest_main.load_timeframe_candles", return_value={"M1": _candles()}),
-            patch("trading_signal_bot.enhanced_backtest_main.run_enhanced_backtest_report", return_value=_report()),
+            patch("trading_signal_bot.enhanced_backtest_main.run_enhanced_backtest_report", return_value=self.report),
+            patch("trading_signal_bot.enhanced_backtest_main.run_enhanced_backtest_report_with_simulation", return_value=self.report),
+            patch("trading_signal_bot.enhanced_backtest_main.run_enhanced_backtest_report_with_realism", return_value=self.report),
         ]
         for item in self._patches:
             item.start()
@@ -702,6 +798,34 @@ def _candles() -> list[Candle]:
         Candle("2026-05-18 00:01", 100.5, 101.5, 99.5, 101.0, 1001.0),
         Candle("2026-05-18 00:02", 101.0, 102.0, 100.0, 101.5, 1002.0),
     ]
+
+
+def _legacy_files() -> set[str]:
+    return {
+        "backtest_trades.csv",
+        "backtest_decisions.csv",
+        "backtest_session_summary.csv",
+        "backtest_summary.json",
+    }
+
+
+def _enhanced_base_files() -> set[str]:
+    return {
+        "enhanced_backtest_summary.json",
+        "backtest_risk_skip_summary.csv",
+        "backtest_session_pnl_summary.csv",
+    }
+
+
+def _realism_files() -> set[str]:
+    return {
+        "backtest_realism_summary.csv",
+        "backtest_cost_summary.csv",
+    }
+
+
+def _output_file_names(output_dir: Path) -> set[str]:
+    return {path.name for path in output_dir.iterdir() if path.is_file()}
 
 
 def _source_text() -> str:
