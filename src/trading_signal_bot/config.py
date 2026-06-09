@@ -103,8 +103,8 @@ def load_signal_config() -> SignalConfig:
         timeframe_paths.setdefault(timeframe, os.getenv(f"SIGNAL_CSV_PATH_{timeframe}", "").strip())
 
     trade_mode = os.getenv("SIGNAL_TRADE_MODE", "high_winrate").strip().lower() or "high_winrate"
-    if trade_mode not in {"high_winrate", "active"}:
-        raise ValueError("SIGNAL_TRADE_MODE must be high_winrate or active")
+    if trade_mode not in {"high_winrate", "active", "asian_breakout"}:
+        raise ValueError("SIGNAL_TRADE_MODE must be high_winrate, active, or asian_breakout")
 
     risk_reward = _get_float("SIGNAL_RISK_REWARD", 1.5, 0.1)
     if risk_reward < 1.5:
@@ -154,6 +154,7 @@ def load_signal_config() -> SignalConfig:
         timeframe_order=timeframe_plan.timeframe_order,
         risk_config=risk_config,
         execution_policy_config=execution_policy_config,
+        asian_max_stop_distance=_get_float("SIGNAL_ASIAN_MAX_STOP_DISTANCE", 0.0, 0.0),
     )
 
 
@@ -214,4 +215,6 @@ def load_auto_trade_config() -> AutoTradeConfig:
         allow_min_volume=_get_bool("AUTO_TRADE_ALLOW_MIN_VOLUME", False),
         magic_number=_get_int("AUTO_TRADE_MAGIC_NUMBER", 20260515, 1),
         comment=os.getenv("AUTO_TRADE_COMMENT", "TradingSignalBot").strip() or "TradingSignalBot",
+        max_trades_per_day=_get_int("AUTO_TRADE_MAX_TRADES_PER_DAY", 0, 0),
+        max_actual_risk_percent=_get_float("AUTO_TRADE_MAX_ACTUAL_RISK_PERCENT", 0.0, 0.0),
     )

@@ -9,12 +9,13 @@
 #include <Trade/Trade.mqh>
 
 input string InpOrderFile       = "trading_signal_order.csv";
-input bool   InpDryRun          = true;
+input bool   InpDryRun          = false;
 input int    InpIntervalSeconds = 1;
 input int    InpMaxSpreadPoints = 500;
 input int    InpDeviationPoints = 50;
 input int    InpMaxPositions    = 1;
 input long   InpMagicNumber     = 20260515;
+input bool   InpDeleteOrderFileAfterProcessing = true;
 
 CTrade trade;
 string last_nonce = "";
@@ -81,6 +82,7 @@ void OnTimer()
    {
       Print("DryRun order intent accepted. Nonce=", intent.nonce, " Action=", intent.action, " Volume=", intent.volume,
             " SL=", intent.stop_loss, " TP=", intent.take_profit);
+      DeleteProcessedOrderFile(intent.nonce);
       return;
    }
 
@@ -191,6 +193,21 @@ void ExecuteIntent(const OrderIntent &intent)
 
    Print("Order placed. Ticket=", trade.ResultOrder(), " Action=", intent.action, " Volume=", volume,
          " SL=", intent.stop_loss, " TP=", intent.take_profit);
+   DeleteProcessedOrderFile(intent.nonce);
+}
+
+void DeleteProcessedOrderFile(const string nonce)
+{
+   if(!InpDeleteOrderFileAfterProcessing)
+      return;
+
+   if(FileDelete(InpOrderFile))
+   {
+      Print("Processed order file deleted. Nonce=", nonce, " File=", InpOrderFile);
+      return;
+   }
+
+   Print("Processed order file could not be deleted. Nonce=", nonce, " File=", InpOrderFile, " Error=", GetLastError());
 }
 
 int CountOpenPositions()

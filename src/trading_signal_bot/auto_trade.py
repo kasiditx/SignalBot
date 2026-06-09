@@ -21,6 +21,7 @@ ORDER_FIELDNAMES = [
     "take_profit",
     "magic_number",
     "comment",
+    "actual_risk_percent",
 ]
 
 
@@ -51,6 +52,22 @@ def process_auto_trade(signal: Signal, config: AutoTradeConfig) -> AutoTradeResu
         volume_step=config.volume_step,
         allow_min_volume=config.allow_min_volume,
     )
+    actual_risk_percent = _actual_risk_percent(
+        account_balance=config.account_balance,
+        entry=entry,
+        stop_loss=stop_loss,
+        contract_size=config.contract_size,
+        volume=volume,
+    )
+    if config.max_actual_risk_percent > 0 and actual_risk_percent > config.max_actual_risk_percent:
+        return AutoTradeResult(
+            status="risk_blocked",
+            message=(
+                "Auto trade skipped because actual risk exceeds "
+                f"{_format_float(config.max_actual_risk_percent)}%."
+            ),
+            volume=volume,
+        )
     nonce = _signal_nonce(signal)
 
     journal_path = Path(config.journal_file)
@@ -58,6 +75,13 @@ def process_auto_trade(signal: Signal, config: AutoTradeConfig) -> AutoTradeResu
         return AutoTradeResult(
             status="duplicate",
             message="Auto trade skipped because this signal nonce was already processed.",
+            nonce=nonce,
+            volume=volume,
+        )
+    if config.max_trades_per_day > 0 and _journal_trades_today(journal_path) >= config.max_trades_per_day:
+        return AutoTradeResult(
+            status="daily_limit",
+            message="Auto trade skipped because the daily trade limit has been reached.",
             nonce=nonce,
             volume=volume,
         )
@@ -73,6 +97,7 @@ def process_auto_trade(signal: Signal, config: AutoTradeConfig) -> AutoTradeResu
         "take_profit": _format_float(take_profit),
         "magic_number": str(config.magic_number),
         "comment": _clean_comment(config.comment),
+        "actual_risk_percent": _format_float(actual_risk_percent),
     }
 
     _append_journal(journal_path, row)
@@ -138,6 +163,19 @@ def _position_size(
     return round(volume, 8)
 
 
+def _actual_risk_percent(
+    account_balance: float,
+    entry: float,
+    stop_loss: float,
+    contract_size: float,
+    volume: float,
+) -> float:
+    if account_balance <= 0:
+        raise ValueError("Account balance must be greater than zero")
+    risk_amount = abs(entry - stop_loss) * contract_size * volume
+    return (risk_amount / account_balance) * 100.0
+
+
 def _signal_nonce(signal: Signal) -> str:
     payload = "|".join(
         [
@@ -158,6 +196,25 @@ def _journal_has_nonce(path: Path, nonce: str) -> bool:
     with path.open("r", encoding="utf-8", newline="") as file:
         reader = csv.DictReader(file)
         return any(row.get("nonce") == nonce for row in reader)
+
+
+def _journal_trades_today(path: Path) -> int:
+    if not path.exists():
+        return 0
+
+    today = datetime.now(tz=UTC).date()
+    count = 0
+    with path.open("r", encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            created_at = row.get("created_at", "")
+            try:
+                created_date = datetime.fromisoformat(created_at).date()
+            except ValueError:
+                continue
+            if created_date == today:
+                count += 1
+    return count
 
 
 def _append_journal(path: Path, row: dict[str, str]) -> None:

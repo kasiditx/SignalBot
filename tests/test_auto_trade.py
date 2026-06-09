@@ -31,22 +31,59 @@ class AutoTradeTest(unittest.TestCase):
 
         self.assertEqual(result.status, "skipped")
 
+    def test_blocks_when_actual_risk_exceeds_limit(self) -> None:
+        config = _config(
+            account_balance=45.0,
+            allow_min_volume=True,
+            max_actual_risk_percent=2.0,
+        )
+        signal = _signal(levels=TradeLevels(entry=100.0, stop_loss=90.0, take_profit=115.0, risk_reward=1.5))
 
-def _config(journal_file: str = "logs/test_auto_trade_journal.csv") -> AutoTradeConfig:
+        result = process_auto_trade(signal, config)
+
+        self.assertEqual(result.status, "risk_blocked")
+
+    def test_blocks_after_daily_trade_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / "journal.csv"
+            config = _config(journal_file=str(journal), max_trades_per_day=1)
+
+            first = process_auto_trade(_signal(), config)
+            second = process_auto_trade(
+                _signal(
+                    action=SignalAction.SELL,
+                    levels=TradeLevels(entry=100.0, stop_loss=101.0, take_profit=98.5, risk_reward=1.5),
+                ),
+                config,
+            )
+
+            self.assertEqual(first.status, "paper")
+            self.assertEqual(second.status, "daily_limit")
+
+
+def _config(
+    journal_file: str = "logs/test_auto_trade_journal.csv",
+    account_balance: float = 1000.0,
+    allow_min_volume: bool = False,
+    max_trades_per_day: int = 0,
+    max_actual_risk_percent: float = 0.0,
+) -> AutoTradeConfig:
     return AutoTradeConfig(
         enabled=True,
         mode="paper",
         order_file="logs/test_order.csv",
         journal_file=journal_file,
-        account_balance=1000.0,
+        account_balance=account_balance,
         risk_percent=0.5,
         contract_size=100.0,
         min_volume=0.01,
         max_volume=0.10,
         volume_step=0.01,
-        allow_min_volume=False,
+        allow_min_volume=allow_min_volume,
         magic_number=20260515,
         comment="TestBot",
+        max_trades_per_day=max_trades_per_day,
+        max_actual_risk_percent=max_actual_risk_percent,
     )
 
 

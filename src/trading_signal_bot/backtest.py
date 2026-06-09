@@ -158,6 +158,8 @@ class BacktestRealismConfig:
     max_daily_loss_percent: float
     max_consecutive_losses: int
     cooldown_minutes: int
+    max_actual_risk_percent: float = 0.0
+    max_trades_per_day: int = 0
 
 
 @dataclass(frozen=True)
@@ -500,12 +502,16 @@ def apply_backtest_money_result(
         stop_loss=trade.stop_loss,
         realism=realism,
     )
-    costs = calculate_backtest_trade_costs(volume, realism)
     risk_distance = abs(trade.entry - trade.stop_loss)
     if risk_distance <= 0:
         raise ValueError("Risk distance must be greater than zero")
 
     risk_amount = risk_distance * realism.contract_size * volume
+    actual_risk_percent = (risk_amount / balance) * 100.0
+    if realism.max_actual_risk_percent > 0 and actual_risk_percent > realism.max_actual_risk_percent:
+        raise ValueError("Actual risk exceeds configured maximum")
+
+    costs = calculate_backtest_trade_costs(volume, realism)
     gross_pnl = trade.r_multiple * risk_amount
     net_pnl = gross_pnl - costs["total_cost"]
     balance_after = balance + net_pnl
@@ -558,6 +564,8 @@ def evaluate_backtest_daily_risk_state(
     realism: BacktestRealismConfig,
 ) -> tuple[bool, tuple[str, ...]]:
     reasons: list[str] = []
+    if realism.max_trades_per_day > 0 and state.trades_today >= realism.max_trades_per_day:
+        reasons.append("max trades per day reached")
     if state.stopped_for_day:
         reasons.append("daily risk stopped for day")
     if state.realized_loss_percent >= realism.max_daily_loss_percent:

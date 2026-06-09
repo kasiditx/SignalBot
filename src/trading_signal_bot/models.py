@@ -101,6 +101,7 @@ class SignalConfig:
     timeframe_order: tuple[str, ...] = ("H4", "H1", "M30", "M15", "M5", "M1")
     risk_config: RiskConfig = field(default_factory=RiskConfig)
     execution_policy_config: ExecutionPolicyConfig = field(default_factory=ExecutionPolicyConfig)
+    asian_max_stop_distance: float = 0.0
 
     def __post_init__(self) -> None:
         if self.risk_reward < 1.5:
@@ -137,6 +138,8 @@ class AutoTradeConfig:
     allow_min_volume: bool
     magic_number: int
     comment: str
+    max_trades_per_day: int = 0
+    max_actual_risk_percent: float = 0.0
 
 
 @dataclass(frozen=True)

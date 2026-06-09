@@ -133,6 +133,8 @@ def build_realism_config_from_env() -> BacktestRealismConfig:
         max_daily_loss_percent=_get_float_env("BACKTEST_MAX_DAILY_LOSS_PERCENT", 3.0, 0.00000001),
         max_consecutive_losses=_get_int_env("BACKTEST_MAX_CONSECUTIVE_LOSSES", 3, 1),
         cooldown_minutes=_get_int_env("BACKTEST_COOLDOWN_MINUTES", 30, 0),
+        max_actual_risk_percent=_get_float_env("BACKTEST_MAX_ACTUAL_RISK_PERCENT", 0.0, 0.0),
+        max_trades_per_day=_get_int_env("BACKTEST_MAX_TRADES_PER_DAY", 0, 0),
     )
 
 

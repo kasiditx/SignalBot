@@ -7,12 +7,12 @@
 #property version   "1.00"
 #property description "Exports OHLCV CSV for an external signal-only bot. No trading operations."
 
-input int             InpBarsD1    = 300;
-input int             InpBarsH4    = 1000;
-input int             InpBarsH1    = 3000;
-input int             InpBarsM30   = 6000;
-input int             InpBarsM15   = 12000;
-input int             InpBarsM5    = 27000;
+input int             InpBarsD1    = 800;
+input int             InpBarsH4    = 5000;
+input int             InpBarsH1    = 20000;
+input int             InpBarsM30   = 40000;
+input int             InpBarsM15   = 80000;
+input int             InpBarsM5    = 120000;
 input int             InpIntervalSeconds = 5;
 input bool            InpExportD1  = true;
 input bool            InpExportH4  = true;

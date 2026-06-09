@@ -8,8 +8,10 @@ from .multitimeframe import (
     format_trend_summary,
     trend_map,
 )
+from .time_utils import parse_candle_timestamp
 
 STRATEGY_NAME = "Pro MTF Price Action Structure"
+ASIAN_BREAKOUT_STRATEGY_NAME = "Asian Range Breakout XAUUSD"
 STRUCTURE_LOOKBACK = 20
 TRAFFIC_LOOKBACK = 40
 RECENT_MOMENTUM_CANDLES = 7
@@ -19,6 +21,14 @@ WICK_BUFFER_ATR_RATIO = 0.10
 MAX_MANUAL_RISK_REWARD = 1.5
 HIGHER_TIMEFRAMES = ("D1", "H4", "H1")
 CONFIRMATION_TIMEFRAMES = ("M30", "M15")
+ASIAN_SESSION_START_HOUR = 0
+ASIAN_SESSION_END_HOUR = 8
+LONDON_TRADE_END_HOUR = 15
+ASIAN_BREAKOUT_BUFFER = 1.5
+ASIAN_RANGE_MAX_ATR_MULTIPLIER = 2.5
+ASIAN_STOP_ATR_MULTIPLIER = 2.0
+ASIAN_TAKE_PROFIT_ATR_MULTIPLIER = 4.0
+ASIAN_RISK_REWARD = ASIAN_TAKE_PROFIT_ATR_MULTIPLIER / ASIAN_STOP_ATR_MULTIPLIER
 
 
 def generate_signal(
@@ -47,6 +57,17 @@ def generate_signal(
     slow_now = slow_ema_values[-1]
     rsi_now = rsi_values[-1]
     atr_now = atr_values[-1]
+
+    if config.trade_mode == "asian_breakout":
+        return _asian_range_breakout_signal(
+            candles=candles,
+            config=config,
+            fast_now=fast_now,
+            slow_now=slow_now,
+            rsi_now=rsi_now,
+            atr_now=atr_now,
+            timeframe_candles=timeframe_candles,
+        )
 
     market_structure = _market_structure(candles)
     trends = trend_map(timeframe_candles or {config.timeframe: candles})
@@ -259,6 +280,269 @@ def _wait_signal(
         rsi=rsi_now,
         atr=atr_now,
         levels=TradeLevels(entry=None, stop_loss=None, take_profit=None, risk_reward=None),
+    )
+
+
+def _asian_range_breakout_signal(
+    candles: list[Candle],
+    config: SignalConfig,
+    fast_now: float,
+    slow_now: float,
+    rsi_now: float,
+    atr_now: float,
+    timeframe_candles: dict[str, list[Candle]] | None,
+) -> Signal:
+    latest = candles[-1]
+    previous = candles[-2]
+    current_time = parse_candle_timestamp(latest.timestamp)
+    current_hour = current_time.hour
+    asian_candles = _asian_session_candles(candles, latest.timestamp)
+    session_atr = _asian_session_atr(timeframe_candles, atr_now)
+    fallback_support, fallback_resistance = _support_resistance(candles)
+    trends = trend_map(timeframe_candles or {config.timeframe: candles})
+    trend_summary = format_trend_summary(trends) if config.multi_timeframe_enabled else f"{config.timeframe}:{_single_timeframe_bias(candles).value}"
+
+    if current_hour < ASIAN_SESSION_END_HOUR:
+        return _asian_wait_signal(
+            config=config,
+            latest=latest,
+            support=fallback_support,
+            resistance=fallback_resistance,
+            fast_now=fast_now,
+            slow_now=slow_now,
+            rsi_now=rsi_now,
+            atr_now=atr_now,
+            trend_summary=trend_summary,
+            setup_type="Building Asian range",
+            wait_reason="ยังอยู่ในช่วงเก็บกรอบเอเชีย 00:00-08:00 UTC จึงยังไม่เข้าเทรด",
+        )
+
+    if current_hour >= LONDON_TRADE_END_HOUR:
+        return _asian_wait_signal(
+            config=config,
+            latest=latest,
+            support=fallback_support,
+            resistance=fallback_resistance,
+            fast_now=fast_now,
+            slow_now=slow_now,
+            rsi_now=rsi_now,
+            atr_now=atr_now,
+            trend_summary=trend_summary,
+            setup_type="London window closed",
+            wait_reason="หมดช่วงเทรด London breakout 08:00-15:00 UTC แล้ว รอสร้างกรอบเอเชียวันถัดไป",
+        )
+
+    if len(asian_candles) < 12:
+        return _asian_wait_signal(
+            config=config,
+            latest=latest,
+            support=fallback_support,
+            resistance=fallback_resistance,
+            fast_now=fast_now,
+            slow_now=slow_now,
+            rsi_now=rsi_now,
+            atr_now=atr_now,
+            trend_summary=trend_summary,
+            setup_type="Incomplete Asian range",
+            wait_reason="ข้อมูลแท่งในช่วงเอเชียยังไม่พอสำหรับคำนวณกรอบ breakout",
+        )
+
+    asian_high = max(candle.high for candle in asian_candles)
+    asian_low = min(candle.low for candle in asian_candles)
+    asian_range = asian_high - asian_low
+    if session_atr <= 0:
+        wait_reason = "ATR ไม่พร้อมหรือเป็นศูนย์ จึงไม่คำนวณ SL/TP"
+    elif asian_range > session_atr * ASIAN_RANGE_MAX_ATR_MULTIPLIER:
+        wait_reason = (
+            "กรอบเอเชียกว้างเกินไปเมื่อเทียบกับ ATR "
+            f"range={asian_range:.2f}, ATR={session_atr:.2f}; ไม่ไล่ breakout วันที่ทองวิ่งไปมากแล้ว"
+        )
+    else:
+        wait_reason = ""
+
+    if wait_reason:
+        return _asian_wait_signal(
+            config=config,
+            latest=latest,
+            support=asian_low,
+            resistance=asian_high,
+            fast_now=fast_now,
+            slow_now=slow_now,
+            rsi_now=rsi_now,
+            atr_now=session_atr,
+            trend_summary=trend_summary,
+            setup_type="Asian range filter rejected",
+            wait_reason=wait_reason,
+        )
+
+    buy_level = asian_high + ASIAN_BREAKOUT_BUFFER
+    sell_level = asian_low - ASIAN_BREAKOUT_BUFFER
+    buy_breakout = previous.close <= buy_level < latest.close and latest.close > latest.open
+    sell_breakout = previous.close >= sell_level > latest.close and latest.close < latest.open
+
+    if buy_breakout:
+        return _build_asian_breakout_signal(
+            action=SignalAction.BUY,
+            candles=candles,
+            config=config,
+            asian_low=asian_low,
+            asian_high=asian_high,
+            fast_now=fast_now,
+            slow_now=slow_now,
+            rsi_now=rsi_now,
+            atr_now=session_atr,
+            trend_summary=trend_summary,
+        )
+    if sell_breakout:
+        return _build_asian_breakout_signal(
+            action=SignalAction.SELL,
+            candles=candles,
+            config=config,
+            asian_low=asian_low,
+            asian_high=asian_high,
+            fast_now=fast_now,
+            slow_now=slow_now,
+            rsi_now=rsi_now,
+            atr_now=session_atr,
+            trend_summary=trend_summary,
+        )
+
+    return _asian_wait_signal(
+        config=config,
+        latest=latest,
+        support=asian_low,
+        resistance=asian_high,
+        fast_now=fast_now,
+        slow_now=slow_now,
+        rsi_now=rsi_now,
+        atr_now=session_atr,
+        trend_summary=trend_summary,
+        setup_type="Waiting for Asian range breakout",
+        wait_reason="รอแท่ง M5 ปิดทะลุกรอบเอเชียพร้อม buffer เพื่อเลี่ยง wick sweep/whipsaw",
+    )
+
+
+def _asian_session_atr(timeframe_candles: dict[str, list[Candle]] | None, fallback_atr: float) -> float:
+    if not timeframe_candles:
+        return fallback_atr
+    h1_candles = timeframe_candles.get("H1")
+    if not h1_candles or len(h1_candles) < 15:
+        return fallback_atr
+    return atr(h1_candles, 14)[-1]
+
+
+def _asian_session_candles(candles: list[Candle], latest_timestamp: str) -> list[Candle]:
+    latest_time = parse_candle_timestamp(latest_timestamp)
+    latest_date = latest_time.date()
+    return [
+        candle
+        for candle in candles
+        if parse_candle_timestamp(candle.timestamp).date() == latest_date
+        and ASIAN_SESSION_START_HOUR <= parse_candle_timestamp(candle.timestamp).hour < ASIAN_SESSION_END_HOUR
+    ]
+
+
+def _asian_wait_signal(
+    config: SignalConfig,
+    latest: Candle,
+    support: float,
+    resistance: float,
+    fast_now: float,
+    slow_now: float,
+    rsi_now: float,
+    atr_now: float,
+    trend_summary: str,
+    setup_type: str,
+    wait_reason: str,
+) -> Signal:
+    return Signal(
+        action=SignalAction.WAIT,
+        symbol=config.symbol,
+        timeframe=config.timeframe,
+        strategy_name=ASIAN_BREAKOUT_STRATEGY_NAME,
+        market_structure="Session momentum: Asian range then London breakout",
+        setup_type=setup_type,
+        trend_summary=trend_summary,
+        trend_alignment="Session filter: trade only 08:00-15:00 UTC after Asian range completes",
+        confidence=Confidence.LOW,
+        reason=wait_reason,
+        entry_condition="รอ M5 body close ทะลุ Asian high/low + buffer ในช่วง London",
+        invalidation="ไม่มีแผนเข้า จึงยังไม่มีจุด invalidation ของ trade",
+        no_trade_reason=wait_reason,
+        support=support,
+        resistance=resistance,
+        latest_close=latest.close,
+        fast_ema=fast_now,
+        slow_ema=slow_now,
+        rsi=rsi_now,
+        atr=atr_now,
+        levels=TradeLevels(entry=None, stop_loss=None, take_profit=None, risk_reward=None),
+    )
+
+
+def _build_asian_breakout_signal(
+    action: SignalAction,
+    candles: list[Candle],
+    config: SignalConfig,
+    asian_low: float,
+    asian_high: float,
+    fast_now: float,
+    slow_now: float,
+    rsi_now: float,
+    atr_now: float,
+    trend_summary: str,
+) -> Signal:
+    latest = candles[-1]
+    entry = latest.close
+    risk_distance = max(atr_now * ASIAN_STOP_ATR_MULTIPLIER, ASIAN_BREAKOUT_BUFFER)
+    if config.asian_max_stop_distance > 0:
+        risk_distance = min(risk_distance, config.asian_max_stop_distance)
+    if action == SignalAction.BUY:
+        stop_loss = entry - risk_distance
+        take_profit = entry + (risk_distance * ASIAN_RISK_REWARD)
+        setup_type = "Asian range bullish breakout"
+        entry_condition = "Buy เมื่อ M5 ปิดเหนือ Asian high + buffer ในช่วง London"
+        invalidation = "ยกเลิก/คัทหากราคากลับลงมาชน SL ใต้ entry ตาม ATR stop"
+        reason = "London session ดันราคาปิดทะลุกรอบบนของเอเชีย เป็น session momentum breakout"
+    else:
+        stop_loss = entry + risk_distance
+        take_profit = entry - (risk_distance * ASIAN_RISK_REWARD)
+        setup_type = "Asian range bearish breakout"
+        entry_condition = "Sell เมื่อ M5 ปิดใต้ Asian low - buffer ในช่วง London"
+        invalidation = "ยกเลิก/คัทหากราคากลับขึ้นมาชน SL เหนือ entry ตาม ATR stop"
+        reason = "London session กดราคาปิดทะลุกรอบล่างของเอเชีย เป็น session momentum breakdown"
+
+    confidence = Confidence.MEDIUM
+    if atr_now > 0 and (asian_high - asian_low) <= atr_now * 1.5:
+        confidence = Confidence.HIGH
+
+    return Signal(
+        action=action,
+        symbol=config.symbol,
+        timeframe=config.timeframe,
+        strategy_name=ASIAN_BREAKOUT_STRATEGY_NAME,
+        market_structure="Session momentum: Asian range compression to London expansion",
+        setup_type=setup_type,
+        trend_summary=trend_summary,
+        trend_alignment="Asian range complete; London window breakout confirmed by M5 body close",
+        confidence=confidence,
+        reason=reason,
+        entry_condition=entry_condition,
+        invalidation=invalidation,
+        no_trade_reason="หยุดหลัง 1 order ต่อวัน และห้ามเข้าเพิ่มหาก actual risk เกินเพดาน small-account mode",
+        support=asian_low,
+        resistance=asian_high,
+        latest_close=latest.close,
+        fast_ema=fast_now,
+        slow_ema=slow_now,
+        rsi=rsi_now,
+        atr=atr_now,
+        levels=TradeLevels(
+            entry=entry,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            risk_reward=ASIAN_RISK_REWARD,
+        ),
     )
 
 
