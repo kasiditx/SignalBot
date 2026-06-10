@@ -84,6 +84,83 @@ class StrategyTest(unittest.TestCase):
         self.assertEqual(signal.action, SignalAction.WAIT)
         self.assertEqual(signal.setup_type, "Building Asian range")
 
+    def test_h4_breakout_retest_generates_buy_after_retest_confirmation(self) -> None:
+        candles = _h4_retest_candles("buy")
+
+        signal = generate_signal(
+            candles,
+            _config(trade_mode="h4_breakout_retest", timeframe="M5"),
+            _h4_retest_timeframes(candles),
+        )
+
+        self.assertEqual(signal.action, SignalAction.BUY)
+        self.assertEqual(signal.strategy_name, "H4 Zone Breakout Retest XAUUSD")
+        self.assertEqual(signal.setup_type, "H4 bullish breakout retest")
+        self.assertLess(signal.levels.stop_loss, signal.levels.entry)
+        self.assertGreater(signal.levels.take_profit, signal.levels.entry)
+
+    def test_h4_breakout_retest_generates_sell_after_retest_confirmation(self) -> None:
+        candles = _h4_retest_candles("sell")
+
+        signal = generate_signal(
+            candles,
+            _config(trade_mode="h4_breakout_retest", timeframe="M5"),
+            _h4_retest_timeframes(candles),
+        )
+
+        self.assertEqual(signal.action, SignalAction.SELL)
+        self.assertEqual(signal.setup_type, "H4 bearish breakout retest")
+        self.assertGreater(signal.levels.stop_loss, signal.levels.entry)
+        self.assertLess(signal.levels.take_profit, signal.levels.entry)
+
+    def test_h4_breakout_retest_waits_when_price_chases_breakout_without_retest(self) -> None:
+        candles = _h4_breakout_without_retest_candles()
+
+        signal = generate_signal(
+            candles,
+            _config(trade_mode="h4_breakout_retest", timeframe="M5"),
+            _h4_retest_timeframes(candles),
+        )
+
+        self.assertEqual(signal.action, SignalAction.WAIT)
+        self.assertEqual(signal.setup_type, "Waiting for H4 breakout retest")
+
+    def test_h4_breakout_retest_expires_when_retest_is_too_late(self) -> None:
+        candles = _h4_retest_candles("buy", retest_timestamp="2026-05-01 09:10")
+
+        signal = generate_signal(
+            candles,
+            _config(trade_mode="h4_breakout_retest", timeframe="M5", h4_retest_max_wait_seconds=60),
+            _h4_retest_timeframes(candles),
+        )
+
+        self.assertEqual(signal.action, SignalAction.WAIT)
+        self.assertEqual(signal.setup_type, "H4 retest signal expired")
+
+    def test_h4_breakout_retest_requires_pivot_and_momentum_filter(self) -> None:
+        candles = _h4_retest_candles("buy", low_volume=True)
+
+        signal = generate_signal(
+            candles,
+            _config(trade_mode="h4_breakout_retest", timeframe="M5"),
+            _h4_retest_timeframes(candles),
+        )
+
+        self.assertEqual(signal.action, SignalAction.WAIT)
+        self.assertEqual(signal.setup_type, "H4 retest filter rejected")
+
+    def test_h4_breakout_retest_rejects_buy_when_rsi_momentum_is_bearish(self) -> None:
+        candles = _h4_retest_candles("buy", bearish_momentum=True)
+
+        signal = generate_signal(
+            candles,
+            _config(trade_mode="h4_breakout_retest", timeframe="M5"),
+            _h4_retest_timeframes(candles),
+        )
+
+        self.assertEqual(signal.action, SignalAction.WAIT)
+        self.assertEqual(signal.setup_type, "H4 retest filter rejected")
+
 
 def _candles(start: float, step: float, count: int) -> list[Candle]:
     candles: list[Candle] = []
@@ -109,7 +186,11 @@ def _candles(start: float, step: float, count: int) -> list[Candle]:
     return candles
 
 
-def _config(trade_mode: str = "high_winrate", timeframe: str = "H1") -> SignalConfig:
+def _config(
+    trade_mode: str = "high_winrate",
+    timeframe: str = "H1",
+    h4_retest_max_wait_seconds: int = 86400,
+) -> SignalConfig:
     return SignalConfig(
         symbol="TEST",
         timeframe=timeframe,
@@ -128,7 +209,85 @@ def _config(trade_mode: str = "high_winrate", timeframe: str = "H1") -> SignalCo
         dry_run=True,
         send_wait=False,
         trade_mode=trade_mode,
+        h4_retest_max_wait_seconds=h4_retest_max_wait_seconds,
     )
+
+
+def _h4_retest_timeframes(candles: list[Candle]) -> dict[str, list[Candle]]:
+    return {
+        "M5": candles,
+        "H4": [
+            Candle("2026-05-01 00:00", 100.0, 101.0, 99.0, 100.2, 5000),
+            Candle("2026-05-01 04:00", 100.2, 100.8, 99.4, 100.0, 5001),
+        ],
+        "D1": [
+            Candle("2026-04-30 00:00", 99.0, 102.0, 98.0, 103.0, 10000),
+            Candle("2026-05-01 00:00", 100.0, 105.0, 98.5, 103.0, 11000),
+        ],
+    }
+
+
+def _h4_retest_candles(
+    direction: str,
+    retest_timestamp: str = "2026-05-01 09:10",
+    low_volume: bool = False,
+    bearish_momentum: bool = False,
+) -> list[Candle]:
+    candles = _m5_flat_candles("2026-05-01", count=96, high=100.7, low=99.3, close=100.0, volume=1000)
+    if direction == "buy":
+        if bearish_momentum:
+            candles.extend(
+                [
+                    Candle("2026-05-01 08:00", 100.4, 103.5, 100.3, 103.0, 3200),
+                    Candle("2026-05-01 08:05", 103.0, 103.1, 101.4, 102.0, 3000),
+                    Candle("2026-05-01 08:10", 102.0, 102.1, 101.2, 101.5, 2900),
+                    Candle(retest_timestamp, 101.5, 102.1, 100.9, 101.9, 3600),
+                ]
+            )
+            return candles
+        candles.extend(
+            [
+                Candle("2026-05-01 08:00", 100.4, 102.2, 100.3, 101.8, 3200),
+                Candle("2026-05-01 08:05", 101.8, 102.4, 101.4, 102.1, 3000),
+                Candle("2026-05-01 08:10", 102.1, 102.6, 101.7, 102.3, 2900),
+                Candle(retest_timestamp, 101.2, 102.1, 100.9, 101.9, 900 if low_volume else 3600),
+            ]
+        )
+        return candles
+    if direction == "sell":
+        candles.extend(
+            [
+                Candle("2026-05-01 08:00", 99.6, 99.7, 97.8, 98.2, 3200),
+                Candle("2026-05-01 08:05", 98.2, 98.6, 97.6, 97.9, 3000),
+                Candle("2026-05-01 08:10", 97.9, 98.3, 97.4, 97.7, 2900),
+                Candle(retest_timestamp, 98.8, 99.1, 97.9, 98.1, 900 if low_volume else 3600),
+            ]
+        )
+        return candles
+    raise ValueError("Unsupported direction")
+
+
+def _h4_breakout_without_retest_candles() -> list[Candle]:
+    candles = _m5_flat_candles("2026-05-01", count=96, high=100.7, low=99.3, close=100.0, volume=1000)
+    candles.extend(
+        [
+            Candle("2026-05-01 08:00", 100.4, 102.2, 100.3, 101.8, 3200),
+            Candle("2026-05-01 08:05", 101.8, 103.0, 101.7, 102.8, 3100),
+            Candle("2026-05-01 08:10", 102.8, 103.4, 102.6, 103.2, 3000),
+        ]
+    )
+    return candles
+
+
+def _m5_flat_candles(date: str, count: int, high: float, low: float, close: float, volume: int) -> list[Candle]:
+    candles: list[Candle] = []
+    for index in range(count):
+        hour = index // 12
+        minute = (index % 12) * 5
+        open_price = close - 0.05 if index % 2 == 0 else close + 0.05
+        close_price = close + 0.05 if index % 2 == 0 else close - 0.05
+        candles.append(Candle(f"{date} {hour:02d}:{minute:02d}", open_price, high, low, close_price, volume + index))
+    return candles
 
 
 def _range_candles(count: int) -> list[Candle]:

@@ -12,6 +12,7 @@ from .time_utils import parse_candle_timestamp
 
 STRATEGY_NAME = "Pro MTF Price Action Structure"
 ASIAN_BREAKOUT_STRATEGY_NAME = "Asian Range Breakout XAUUSD"
+H4_BREAKOUT_RETEST_STRATEGY_NAME = "H4 Zone Breakout Retest XAUUSD"
 STRUCTURE_LOOKBACK = 20
 TRAFFIC_LOOKBACK = 40
 RECENT_MOMENTUM_CANDLES = 7
@@ -60,6 +61,16 @@ def generate_signal(
 
     if config.trade_mode == "asian_breakout":
         return _asian_range_breakout_signal(
+            candles=candles,
+            config=config,
+            fast_now=fast_now,
+            slow_now=slow_now,
+            rsi_now=rsi_now,
+            atr_now=atr_now,
+            timeframe_candles=timeframe_candles,
+        )
+    if config.trade_mode == "h4_breakout_retest":
+        return _h4_breakout_retest_signal(
             candles=candles,
             config=config,
             fast_now=fast_now,
@@ -429,6 +440,315 @@ def _asian_session_atr(timeframe_candles: dict[str, list[Candle]] | None, fallba
     if not h1_candles or len(h1_candles) < 15:
         return fallback_atr
     return atr(h1_candles, 14)[-1]
+
+
+def _h4_breakout_retest_signal(
+    candles: list[Candle],
+    config: SignalConfig,
+    fast_now: float,
+    slow_now: float,
+    rsi_now: float,
+    atr_now: float,
+    timeframe_candles: dict[str, list[Candle]] | None,
+) -> Signal:
+    latest = candles[-1]
+    latest_time = parse_candle_timestamp(latest.timestamp)
+    fallback_support, fallback_resistance = _support_resistance(candles)
+    trends = trend_map(timeframe_candles or {config.timeframe: candles})
+    trend_summary = format_trend_summary(trends) if config.multi_timeframe_enabled else f"{config.timeframe}:{_single_timeframe_bias(candles).value}"
+    h4_zone = _first_h4_zone_for_day(timeframe_candles, latest_time)
+    if h4_zone is None:
+        return _h4_wait_signal(
+            config,
+            latest,
+            fallback_support,
+            fallback_resistance,
+            fast_now,
+            slow_now,
+            rsi_now,
+            atr_now,
+            trend_summary,
+            "Waiting for H4 opening zone",
+            "ยังไม่มี H4 แท่งแรกของวันสำหรับสร้างกรอบ breakout/retest",
+        )
+
+    zone_high, zone_low = h4_zone
+    breakout = _latest_h4_zone_breakout(candles, zone_high, zone_low, config.h4_retest_buffer)
+    if breakout is None:
+        return _h4_wait_signal(
+            config,
+            latest,
+            zone_low,
+            zone_high,
+            fast_now,
+            slow_now,
+            rsi_now,
+            atr_now,
+            trend_summary,
+            "Waiting for H4 zone breakout",
+            "รอ M5 ปิดทะลุ H4 opening range ก่อน จากนั้นค่อยรอ retest ไม่ไล่ราคา",
+        )
+
+    action, breakout_time = breakout
+    if latest_time.date() != breakout_time.date() or (latest_time - breakout_time).total_seconds() > config.h4_retest_max_wait_seconds:
+        return _h4_wait_signal(
+            config,
+            latest,
+            zone_low,
+            zone_high,
+            fast_now,
+            slow_now,
+            rsi_now,
+            atr_now,
+            trend_summary,
+            "H4 retest signal expired",
+            "breakout เกิดนานเกิน MaxWaitSeconds หรือข้ามวันแล้ว จึงยกเลิกสิทธิ์รอ retest",
+        )
+
+    if not _is_h4_retest_confirmation(action, latest, zone_high, zone_low, config.h4_retest_tolerance):
+        return _h4_wait_signal(
+            config,
+            latest,
+            zone_low,
+            zone_high,
+            fast_now,
+            slow_now,
+            rsi_now,
+            atr_now,
+            trend_summary,
+            "Waiting for H4 breakout retest",
+            "ราคา breakout แล้ว แต่ยังไม่กลับมา retest โซนเดิมพร้อมปิดยืนยันใน M5",
+        )
+
+    if not _passes_pivot_momentum_filter(action, candles, latest, timeframe_candles, config, atr_now, rsi_now, zone_high, zone_low):
+        return _h4_wait_signal(
+            config,
+            latest,
+            zone_low,
+            zone_high,
+            fast_now,
+            slow_now,
+            rsi_now,
+            atr_now,
+            trend_summary,
+            "H4 retest filter rejected",
+            "retest เกิดแล้ว แต่ยังไม่ผ่าน Pivot + Momentum filter จึงกันสัญญาณหลอก",
+        )
+
+    return _build_h4_retest_signal(
+        action=action,
+        candles=candles,
+        config=config,
+        zone_low=zone_low,
+        zone_high=zone_high,
+        fast_now=fast_now,
+        slow_now=slow_now,
+        rsi_now=rsi_now,
+        atr_now=atr_now,
+        trend_summary=trend_summary,
+    )
+
+
+def _first_h4_zone_for_day(
+    timeframe_candles: dict[str, list[Candle]] | None,
+    current_time,
+) -> tuple[float, float] | None:
+    if not timeframe_candles:
+        return None
+    h4_candles = timeframe_candles.get("H4")
+    if not h4_candles:
+        return None
+    current_date = current_time.date()
+    same_day = [candle for candle in h4_candles if parse_candle_timestamp(candle.timestamp).date() == current_date]
+    if not same_day:
+        return None
+    opening_candle = min(same_day, key=lambda candle: parse_candle_timestamp(candle.timestamp))
+    return opening_candle.high, opening_candle.low
+
+
+def _latest_h4_zone_breakout(
+    candles: list[Candle],
+    zone_high: float,
+    zone_low: float,
+    buffer: float,
+) -> tuple[SignalAction, object] | None:
+    buy_level = zone_high + buffer
+    sell_level = zone_low - buffer
+    for candle in reversed(candles[:-1]):
+        candle_time = parse_candle_timestamp(candle.timestamp)
+        if candle.close > buy_level:
+            return SignalAction.BUY, candle_time
+        if candle.close < sell_level:
+            return SignalAction.SELL, candle_time
+    return None
+
+
+def _is_h4_retest_confirmation(
+    action: SignalAction,
+    latest: Candle,
+    zone_high: float,
+    zone_low: float,
+    tolerance: float,
+) -> bool:
+    if action == SignalAction.BUY:
+        touched_zone = latest.low <= zone_high + tolerance
+        reclaimed_zone = latest.close > zone_high and latest.close > latest.open
+        return touched_zone and reclaimed_zone
+    touched_zone = latest.high >= zone_low - tolerance
+    reclaimed_zone = latest.close < zone_low and latest.close < latest.open
+    return touched_zone and reclaimed_zone
+
+
+def _passes_pivot_momentum_filter(
+    action: SignalAction,
+    candles: list[Candle],
+    latest: Candle,
+    timeframe_candles: dict[str, list[Candle]] | None,
+    config: SignalConfig,
+    atr_now: float,
+    rsi_now: float,
+    zone_high: float,
+    zone_low: float,
+) -> bool:
+    near_significant_zone = (
+        abs(latest.close - zone_high) <= config.h4_retest_pivot_tolerance
+        or abs(latest.close - zone_low) <= config.h4_retest_pivot_tolerance
+        or _is_near_daily_or_weekly_pivot(latest.close, timeframe_candles, config.h4_retest_pivot_tolerance)
+    )
+    if not near_significant_zone:
+        return False
+    recent = candles[-21:-1]
+    if not recent:
+        return False
+    average_volume = sum(candle.volume for candle in recent) / len(recent)
+    volume_expansion = latest.volume >= average_volume * config.h4_retest_momentum_volume_multiplier
+    body = abs(latest.close - latest.open)
+    body_momentum = atr_now > 0 and body >= atr_now * 0.35
+    directional_close = latest.close > latest.open if action == SignalAction.BUY else latest.close < latest.open
+    rsi_momentum = rsi_now > 50 if action == SignalAction.BUY else rsi_now < 50
+    return directional_close and volume_expansion and body_momentum and rsi_momentum
+
+
+def _is_near_daily_or_weekly_pivot(
+    price: float,
+    timeframe_candles: dict[str, list[Candle]] | None,
+    tolerance: float,
+) -> bool:
+    if not timeframe_candles:
+        return False
+    pivots = _daily_weekly_pivots(timeframe_candles.get("D1") or [])
+    return any(abs(price - pivot) <= tolerance for pivot in pivots)
+
+
+def _daily_weekly_pivots(d1_candles: list[Candle]) -> tuple[float, ...]:
+    if len(d1_candles) < 2:
+        return ()
+    previous_day = d1_candles[-2]
+    daily_pivot = (previous_day.high + previous_day.low + previous_day.close) / 3.0
+    pivots = [daily_pivot]
+    previous_week = d1_candles[-7:-2]
+    if previous_week:
+        weekly_high = max(candle.high for candle in previous_week)
+        weekly_low = min(candle.low for candle in previous_week)
+        weekly_close = previous_week[-1].close
+        pivots.append((weekly_high + weekly_low + weekly_close) / 3.0)
+    return tuple(pivots)
+
+
+def _h4_wait_signal(
+    config: SignalConfig,
+    latest: Candle,
+    support: float,
+    resistance: float,
+    fast_now: float,
+    slow_now: float,
+    rsi_now: float,
+    atr_now: float,
+    trend_summary: str,
+    setup_type: str,
+    wait_reason: str,
+) -> Signal:
+    return Signal(
+        action=SignalAction.WAIT,
+        symbol=config.symbol,
+        timeframe=config.timeframe,
+        strategy_name=H4_BREAKOUT_RETEST_STRATEGY_NAME,
+        market_structure="H4 opening range breakout with M5 retest confirmation",
+        setup_type=setup_type,
+        trend_summary=trend_summary,
+        trend_alignment="H4 zone first, M5 retest second, Pivot + Momentum filter required",
+        confidence=Confidence.LOW,
+        reason=wait_reason,
+        entry_condition="รอ breakout จาก H4 opening range แล้วรอ M5 retest/confirm ไม่ไล่ราคา",
+        invalidation="ไม่มีแผนเข้า จึงยังไม่มีจุด invalidation ของ trade",
+        no_trade_reason=wait_reason,
+        support=support,
+        resistance=resistance,
+        latest_close=latest.close,
+        fast_ema=fast_now,
+        slow_ema=slow_now,
+        rsi=rsi_now,
+        atr=atr_now,
+        levels=TradeLevels(entry=None, stop_loss=None, take_profit=None, risk_reward=None),
+    )
+
+
+def _build_h4_retest_signal(
+    action: SignalAction,
+    candles: list[Candle],
+    config: SignalConfig,
+    zone_low: float,
+    zone_high: float,
+    fast_now: float,
+    slow_now: float,
+    rsi_now: float,
+    atr_now: float,
+    trend_summary: str,
+) -> Signal:
+    latest = candles[-1]
+    entry = latest.close
+    stop_buffer = max(config.h4_retest_stop_buffer, atr_now * 0.2)
+    if action == SignalAction.BUY:
+        stop_loss = min(latest.low, zone_high) - stop_buffer
+        risk_distance = entry - stop_loss
+        take_profit = entry + risk_distance * config.risk_reward
+        setup_type = "H4 bullish breakout retest"
+        reason = "ราคาทะลุ H4 opening range แล้วกลับมา retest กรอบบน พร้อม Pivot + Momentum confirmation"
+        entry_condition = "Buy เมื่อ M5 retest H4 high เดิมแล้วปิดกลับเหนือโซนด้วย momentum"
+        invalidation = "ยกเลิก/คัทหากราคากลับลงใต้โซน retest และชน SL"
+    else:
+        stop_loss = max(latest.high, zone_low) + stop_buffer
+        risk_distance = stop_loss - entry
+        take_profit = entry - risk_distance * config.risk_reward
+        setup_type = "H4 bearish breakout retest"
+        reason = "ราคาทะลุ H4 opening range ลง แล้วกลับมา retest กรอบล่าง พร้อม Pivot + Momentum confirmation"
+        entry_condition = "Sell เมื่อ M5 retest H4 low เดิมแล้วปิดกลับใต้โซนด้วย momentum"
+        invalidation = "ยกเลิก/คัทหากราคากลับขึ้นเหนือโซน retest และชน SL"
+
+    return Signal(
+        action=action,
+        symbol=config.symbol,
+        timeframe=config.timeframe,
+        strategy_name=H4_BREAKOUT_RETEST_STRATEGY_NAME,
+        market_structure="H4 opening range breakout with M5 retest confirmation",
+        setup_type=setup_type,
+        trend_summary=trend_summary,
+        trend_alignment="H4 breakout happened first; M5 retest confirmed; Pivot + Momentum filter passed",
+        confidence=Confidence.MEDIUM,
+        reason=reason,
+        entry_condition=entry_condition,
+        invalidation=invalidation,
+        no_trade_reason="ห้ามเข้าเพิ่มถ้าเลย MaxWaitSeconds, ไม่ผ่าน pivot/momentum, หรือ daily drawdown pause ทำงาน",
+        support=zone_low,
+        resistance=zone_high,
+        latest_close=latest.close,
+        fast_ema=fast_now,
+        slow_ema=slow_now,
+        rsi=rsi_now,
+        atr=atr_now,
+        levels=TradeLevels(entry=entry, stop_loss=stop_loss, take_profit=take_profit, risk_reward=config.risk_reward),
+        breakeven_trigger_r=config.h4_retest_breakeven_trigger_r,
+    )
 
 
 def _asian_session_candles(candles: list[Candle], latest_timestamp: str) -> list[Candle]:

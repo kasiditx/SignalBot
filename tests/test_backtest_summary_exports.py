@@ -110,7 +110,7 @@ class BacktestSummaryExportsTest(unittest.TestCase):
             self.assertEqual(rows[0]["open_at_end"], "1")
             self.assertEqual(rows[0]["loss_both_hit"], "1")
 
-    def test_export_backtest_risk_skip_summary_csv_writes_four_reason_rows_with_counts(self) -> None:
+    def test_export_backtest_risk_skip_summary_csv_writes_reason_rows_with_counts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "backtest_risk_skip_summary.csv"
 
@@ -125,6 +125,7 @@ class BacktestSummaryExportsTest(unittest.TestCase):
                     "daily risk stopped for day",
                     "max daily loss reached",
                     "max consecutive losses reached",
+                    "weekly loss pause active",
                 ],
             )
             self.assertEqual({row["reason"]: row["count"] for row in rows}["cooldown active"], "2")
@@ -137,7 +138,7 @@ class BacktestSummaryExportsTest(unittest.TestCase):
             export_backtest_risk_skip_summary_csv(_empty_report(), path)
 
             rows = _csv_rows(path)
-            self.assertEqual(len(rows), 4)
+            self.assertEqual(len(rows), 5)
             self.assertTrue(all(row["count"] == "0" for row in rows))
 
     def test_export_backtest_cost_summary_csv_writes_expected_totals(self) -> None:
@@ -212,7 +213,7 @@ class BacktestSummaryExportsTest(unittest.TestCase):
             export_enhanced_backtest_summary_files(_empty_report(), output_dir, realism=_realism_config(), mode="realism")
 
             self.assertTrue((output_dir / "enhanced_backtest_summary.json").exists())
-            self.assertEqual(len(_csv_rows(output_dir / "backtest_risk_skip_summary.csv")), 4)
+            self.assertEqual(len(_csv_rows(output_dir / "backtest_risk_skip_summary.csv")), 5)
             self.assertEqual(len(_csv_rows(output_dir / "backtest_session_pnl_summary.csv")), 4)
 
     def test_legacy_export_backtest_report_still_writes_original_four_files(self) -> None:

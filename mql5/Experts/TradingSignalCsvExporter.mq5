@@ -13,13 +13,19 @@ input int             InpBarsH1    = 20000;
 input int             InpBarsM30   = 40000;
 input int             InpBarsM15   = 80000;
 input int             InpBarsM5    = 120000;
+input int             InpHistoryMonths = 13;
 input int             InpIntervalSeconds = 5;
+input int             InpCoverageWarningSeconds = 300;
 input bool            InpExportD1  = true;
 input bool            InpExportH4  = true;
 input bool            InpExportH1  = true;
 input bool            InpExportM30 = true;
 input bool            InpExportM15 = true;
 input bool            InpExportM5  = true;
+
+datetime last_coverage_warning_at = 0;
+const int HISTORY_MONTH_DAYS = 31;
+const int SECONDS_PER_DAY = 86400;
 
 int OnInit()
 {
@@ -29,9 +35,21 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
    }
 
+   if(InpHistoryMonths < 0)
+   {
+      Print("InpHistoryMonths must be zero or greater");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
    if(InpIntervalSeconds < 5)
    {
       Print("InpIntervalSeconds must be at least 5");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(InpCoverageWarningSeconds < 30)
+   {
+      Print("InpCoverageWarningSeconds must be at least 30");
       return INIT_PARAMETERS_INCORRECT;
    }
 
@@ -78,29 +96,34 @@ void ExportAllRates()
 
 void ExportRatesFor(ENUM_TIMEFRAMES timeframe, string file_name, int requested_bars)
 {
-   int available_bars = Bars(_Symbol, timeframe);
-   if(available_bars <= 0)
+   if(requested_bars < 60)
    {
-      Print("No available bars yet. Symbol=", _Symbol, " timeframe=", EnumToString(timeframe), " error=", GetLastError());
-      return;
-   }
-
-   int bars_to_copy = MathMin(requested_bars, available_bars);
-   if(bars_to_copy < 60)
-   {
-      Print("Not enough bars yet. Symbol=", _Symbol, " timeframe=", EnumToString(timeframe), " available=", available_bars);
+      Print("Requested bars must be at least 60. Symbol=", _Symbol, " timeframe=", EnumToString(timeframe), " requested=", requested_bars);
       return;
    }
 
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
 
-   int copied = CopyRates(_Symbol, timeframe, 0, bars_to_copy, rates);
+   datetime requested_start = RequestedHistoryStart();
+   int copied = 0;
+   if(requested_start > 0)
+      copied = CopyRates(_Symbol, timeframe, requested_start, TimeCurrent(), rates);
+   else
+      copied = CopyRates(_Symbol, timeframe, 0, requested_bars, rates);
+
    if(copied <= 0)
    {
-      Print("CopyRates failed. Symbol=", _Symbol, " timeframe=", EnumToString(timeframe), " requested=", bars_to_copy, " available=", available_bars, " error=", GetLastError());
+      int available_bars = Bars(_Symbol, timeframe);
+      Print("CopyRates failed. Symbol=", _Symbol, " timeframe=", EnumToString(timeframe), " requested_start=", FormatTime(requested_start),
+            " requested_bars=", requested_bars, " available=", available_bars, " error=", GetLastError());
       return;
    }
+
+   if(copied > requested_bars)
+      copied = requested_bars;
+
+   WarnIfCoverageIsShort(timeframe, requested_start, rates[copied - 1].time, copied);
 
    int handle = FileOpen(file_name, FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
    if(handle == INVALID_HANDLE)
@@ -125,4 +148,42 @@ void ExportRatesFor(ENUM_TIMEFRAMES timeframe, string file_name, int requested_b
    }
 
    FileClose(handle);
+}
+
+datetime RequestedHistoryStart()
+{
+   if(InpHistoryMonths <= 0)
+      return 0;
+
+   long seconds = (long)InpHistoryMonths * HISTORY_MONTH_DAYS * SECONDS_PER_DAY;
+   return (datetime)(TimeCurrent() - seconds);
+}
+
+void WarnIfCoverageIsShort(ENUM_TIMEFRAMES timeframe, datetime requested_start, datetime first_exported, int copied)
+{
+   if(requested_start <= 0)
+      return;
+
+   int period_seconds = PeriodSeconds(timeframe);
+   if(period_seconds <= 0)
+      period_seconds = 60;
+
+   if(first_exported <= requested_start + period_seconds)
+      return;
+
+   datetime now = TimeCurrent();
+   if(last_coverage_warning_at > 0 && now - last_coverage_warning_at < InpCoverageWarningSeconds)
+      return;
+
+   last_coverage_warning_at = now;
+   Print("History coverage is still short. Symbol=", _Symbol, " timeframe=", EnumToString(timeframe),
+         " requested_start=", FormatTime(requested_start), " first_exported=", FormatTime(first_exported),
+         " copied=", copied, ". Open MT5 History Center/scroll chart back, increase Tools > Options > Charts > Max bars, then reattach exporter.");
+}
+
+string FormatTime(datetime value)
+{
+   if(value <= 0)
+      return "latest-bars";
+   return TimeToString(value, TIME_DATE | TIME_MINUTES);
 }

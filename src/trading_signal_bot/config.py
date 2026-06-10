@@ -103,8 +103,8 @@ def load_signal_config() -> SignalConfig:
         timeframe_paths.setdefault(timeframe, os.getenv(f"SIGNAL_CSV_PATH_{timeframe}", "").strip())
 
     trade_mode = os.getenv("SIGNAL_TRADE_MODE", "high_winrate").strip().lower() or "high_winrate"
-    if trade_mode not in {"high_winrate", "active", "asian_breakout"}:
-        raise ValueError("SIGNAL_TRADE_MODE must be high_winrate, active, or asian_breakout")
+    if trade_mode not in {"high_winrate", "active", "asian_breakout", "h4_breakout_retest"}:
+        raise ValueError("SIGNAL_TRADE_MODE must be high_winrate, active, asian_breakout, or h4_breakout_retest")
 
     risk_reward = _get_float("SIGNAL_RISK_REWARD", 1.5, 0.1)
     if risk_reward < 1.5:
@@ -155,6 +155,13 @@ def load_signal_config() -> SignalConfig:
         risk_config=risk_config,
         execution_policy_config=execution_policy_config,
         asian_max_stop_distance=_get_float("SIGNAL_ASIAN_MAX_STOP_DISTANCE", 0.0, 0.0),
+        h4_retest_max_wait_seconds=_get_int("SIGNAL_H4_RETEST_MAX_WAIT_SECONDS", 86400, 60),
+        h4_retest_buffer=_get_float("SIGNAL_H4_RETEST_BUFFER", 0.5, 0.0),
+        h4_retest_tolerance=_get_float("SIGNAL_H4_RETEST_TOLERANCE", 0.8, 0.0),
+        h4_retest_pivot_tolerance=_get_float("SIGNAL_H4_RETEST_PIVOT_TOLERANCE", 3.0, 0.0),
+        h4_retest_momentum_volume_multiplier=_get_float("SIGNAL_H4_RETEST_MOMENTUM_VOLUME_MULTIPLIER", 1.5, 0.1),
+        h4_retest_stop_buffer=_get_float("SIGNAL_H4_RETEST_STOP_BUFFER", 1.2, 0.0),
+        h4_retest_breakeven_trigger_r=_get_float("SIGNAL_H4_RETEST_BREAKEVEN_TRIGGER_R", 0.6, 0.1),
     )
 
 

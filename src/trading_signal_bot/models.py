@@ -102,6 +102,13 @@ class SignalConfig:
     risk_config: RiskConfig = field(default_factory=RiskConfig)
     execution_policy_config: ExecutionPolicyConfig = field(default_factory=ExecutionPolicyConfig)
     asian_max_stop_distance: float = 0.0
+    h4_retest_max_wait_seconds: int = 86400
+    h4_retest_buffer: float = 0.5
+    h4_retest_tolerance: float = 0.8
+    h4_retest_pivot_tolerance: float = 3.0
+    h4_retest_momentum_volume_multiplier: float = 1.5
+    h4_retest_stop_buffer: float = 1.2
+    h4_retest_breakeven_trigger_r: float = 0.6
 
     def __post_init__(self) -> None:
         if self.risk_reward < 1.5:
@@ -173,3 +180,4 @@ class Signal:
     rsi: float
     atr: float
     levels: TradeLevels
+    breakeven_trigger_r: float | None = None

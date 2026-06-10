@@ -135,6 +135,10 @@ def build_realism_config_from_env() -> BacktestRealismConfig:
         cooldown_minutes=_get_int_env("BACKTEST_COOLDOWN_MINUTES", 30, 0),
         max_actual_risk_percent=_get_float_env("BACKTEST_MAX_ACTUAL_RISK_PERCENT", 0.0, 0.0),
         max_trades_per_day=_get_int_env("BACKTEST_MAX_TRADES_PER_DAY", 0, 0),
+        drawdown_pause_percent=_get_float_env("BACKTEST_DRAWDOWN_PAUSE_PERCENT", 0.0, 0.0),
+        drawdown_pause_days=_get_int_env("BACKTEST_DRAWDOWN_PAUSE_DAYS", 0, 0),
+        weekly_loss_pause_count=_get_int_env("BACKTEST_WEEKLY_LOSS_PAUSE_COUNT", 0, 0),
+        weekly_loss_pause_days=_get_int_env("BACKTEST_WEEKLY_LOSS_PAUSE_DAYS", 0, 0),
     )
 
 

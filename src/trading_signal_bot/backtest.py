@@ -24,7 +24,9 @@ _RISK_SKIP_REASONS = (
     "daily risk stopped for day",
     "max daily loss reached",
     "max consecutive losses reached",
+    "weekly loss pause active",
 )
+H4_RETEST_DEFAULT_BREAKEVEN_TRIGGER_R = 0.6
 
 
 @dataclass(frozen=True)
@@ -160,6 +162,10 @@ class BacktestRealismConfig:
     cooldown_minutes: int
     max_actual_risk_percent: float = 0.0
     max_trades_per_day: int = 0
+    drawdown_pause_percent: float = 0.0
+    drawdown_pause_days: int = 0
+    weekly_loss_pause_count: int = 0
+    weekly_loss_pause_days: int = 0
 
 
 @dataclass(frozen=True)
@@ -171,6 +177,9 @@ class BacktestDailyRiskState:
     realized_loss_percent: float
     cooldown_until: datetime | None
     stopped_for_day: bool
+    peak_balance: float = 0.0
+    weekly_consecutive_losses: int = 0
+    week_key: str = ""
 
 
 @dataclass
@@ -342,13 +351,29 @@ def backtest_candidate_from_signal(
     if levels.take_profit is None:
         raise ValueError("Signal take profit is required to build a backtest candidate")
 
+    take_profit = float(levels.take_profit)
+    tp1 = None
+    if getattr(signal, "strategy_name", "") == "H4 Zone Breakout Retest XAUUSD":
+        risk_distance = abs(float(levels.entry) - float(levels.stop_loss))
+        trigger_r = getattr(signal, "breakeven_trigger_r", H4_RETEST_DEFAULT_BREAKEVEN_TRIGGER_R)
+        try:
+            breakeven_trigger_r = float(trigger_r)
+        except (TypeError, ValueError):
+            breakeven_trigger_r = H4_RETEST_DEFAULT_BREAKEVEN_TRIGGER_R
+        if breakeven_trigger_r <= 0:
+            breakeven_trigger_r = H4_RETEST_DEFAULT_BREAKEVEN_TRIGGER_R
+        if action == SignalAction.BUY:
+            tp1 = float(levels.entry) + (risk_distance * breakeven_trigger_r)
+        else:
+            tp1 = float(levels.entry) - (risk_distance * breakeven_trigger_r)
+
     return BacktestCandidate(
         decision=decision,
         action=action,
         entry=float(levels.entry),
         stop_loss=float(levels.stop_loss),
-        tp1=None,
-        tp2=float(levels.take_profit),
+        tp1=tp1,
+        tp2=take_profit,
         risk_reward=getattr(levels, "risk_reward", None) or decision.risk_reward,
         signal_index=signal_index,
     )
@@ -370,7 +395,19 @@ def simulate_enhanced_trade(
         raise ValueError("Risk distance must be greater than zero")
 
     entry_candle = execution_candles[min(candidate.signal_index, len(execution_candles) - 1)]
+    breakeven_active = False
     for candle in execution_candles[candidate.signal_index + 1 :]:
+        if breakeven_active and _breakeven_stop_hit(candidate, candle):
+            return _enhanced_trade_result(
+                candidate=candidate,
+                entry_time=entry_candle.timestamp,
+                exit_time=candle.timestamp,
+                target=target,
+                result="BREAKEVEN",
+                r_multiple=0.0,
+                loss_reason=None,
+            )
+
         stopped, target_hit = _enhanced_exit_hits(candidate, candle, target)
         if stopped and target_hit:
             return _enhanced_trade_result(
@@ -402,6 +439,8 @@ def simulate_enhanced_trade(
                 r_multiple=abs(target - candidate.entry) / risk_distance,
                 loss_reason=None,
             )
+        if candidate.tp1 is not None and _target_hit(candidate.action, candle, candidate.tp1):
+            breakeven_active = True
 
     last = execution_candles[-1]
     if candidate.action == SignalAction.BUY:
@@ -417,6 +456,18 @@ def simulate_enhanced_trade(
         r_multiple=r_multiple,
         loss_reason="open_at_end",
     )
+
+
+def _target_hit(action: SignalAction, candle: Candle, target: float) -> bool:
+    if action == SignalAction.BUY:
+        return candle.high >= target
+    return candle.low <= target
+
+
+def _breakeven_stop_hit(candidate: BacktestCandidate, candle: Candle) -> bool:
+    if candidate.action == SignalAction.BUY:
+        return candle.low <= candidate.entry
+    return candle.high >= candidate.entry
 
 
 def calculate_backtest_position_size(
@@ -543,9 +594,12 @@ def reset_backtest_daily_risk_state(
         trades_today=0,
         losses_today=0,
         consecutive_losses=0,
+        weekly_consecutive_losses=0,
+        week_key=_week_key(current_time),
         realized_loss_percent=0.0,
         cooldown_until=None,
         stopped_for_day=False,
+        peak_balance=0.0,
     )
 
 
@@ -554,7 +608,48 @@ def reset_daily_risk_state_if_new_day(
     current_time: datetime,
 ) -> BacktestDailyRiskState:
     if current_time.date().isoformat() != state.date:
-        return reset_backtest_daily_risk_state(current_time)
+        next_state = reset_backtest_daily_risk_state(current_time)
+        weekly_consecutive_losses = (
+            state.weekly_consecutive_losses if state.week_key == next_state.week_key else 0
+        )
+        if state.cooldown_until is not None and current_time < state.cooldown_until:
+            return BacktestDailyRiskState(
+                date=next_state.date,
+                trades_today=0,
+                losses_today=0,
+                consecutive_losses=state.consecutive_losses,
+                weekly_consecutive_losses=weekly_consecutive_losses,
+                week_key=next_state.week_key,
+                realized_loss_percent=0.0,
+                cooldown_until=state.cooldown_until,
+                stopped_for_day=True,
+                peak_balance=state.peak_balance,
+            )
+        if state.peak_balance > 0:
+            return BacktestDailyRiskState(
+                date=next_state.date,
+                trades_today=0,
+                losses_today=0,
+                consecutive_losses=0,
+                weekly_consecutive_losses=weekly_consecutive_losses,
+                week_key=next_state.week_key,
+                realized_loss_percent=0.0,
+                cooldown_until=None,
+                stopped_for_day=False,
+                peak_balance=state.peak_balance,
+            )
+        return BacktestDailyRiskState(
+            date=next_state.date,
+            trades_today=0,
+            losses_today=0,
+            consecutive_losses=0,
+            weekly_consecutive_losses=weekly_consecutive_losses,
+            week_key=next_state.week_key,
+            realized_loss_percent=0.0,
+            cooldown_until=None,
+            stopped_for_day=False,
+            peak_balance=0.0,
+        )
     return state
 
 
@@ -574,6 +669,13 @@ def evaluate_backtest_daily_risk_state(
         reasons.append("max consecutive losses reached")
     if state.cooldown_until is not None and current_time < state.cooldown_until:
         reasons.append("cooldown active")
+    if (
+        realism.weekly_loss_pause_count > 0
+        and state.weekly_consecutive_losses >= realism.weekly_loss_pause_count
+        and state.cooldown_until is not None
+        and current_time < state.cooldown_until
+    ):
+        reasons.append("weekly loss pause active")
     return bool(reasons), tuple(reasons)
 
 
@@ -589,37 +691,79 @@ def update_backtest_daily_risk_state_after_trade(
     trades_today = state.trades_today + 1
     losses_today = state.losses_today
     consecutive_losses = state.consecutive_losses
+    weekly_consecutive_losses = state.weekly_consecutive_losses
     realized_loss_percent = state.realized_loss_percent
     cooldown_until = state.cooldown_until
     is_loss = trade.pnl < 0 or trade.result.startswith("LOSS")
+    if trade.balance_after is None:
+        raise ValueError("Trade balance_after is required to update drawdown pause state")
+
+    previous_peak_balance = state.peak_balance if state.peak_balance > 0 else realism.initial_balance
+    peak_balance = max(previous_peak_balance, trade.balance_after)
+    drawdown_pause_triggered = False
 
     if is_loss:
         losses_today += 1
         consecutive_losses += 1
+        weekly_consecutive_losses += 1
         realized_loss_percent += abs(trade.pnl) / realism.initial_balance * 100.0
         cooldown_until = (
             current_time + timedelta(minutes=realism.cooldown_minutes)
             if realism.cooldown_minutes > 0
             else None
         )
+        weekly_loss_pause_triggered = (
+            realism.weekly_loss_pause_count > 0
+            and realism.weekly_loss_pause_days > 0
+            and weekly_consecutive_losses >= realism.weekly_loss_pause_count
+        )
+        if weekly_loss_pause_triggered:
+            cooldown_until = current_time + timedelta(days=realism.weekly_loss_pause_days)
+        if (
+            realism.drawdown_pause_percent > 0
+            and realism.drawdown_pause_days > 0
+            and _drawdown_percent(peak_balance, trade.balance_after) >= realism.drawdown_pause_percent
+        ):
+            cooldown_until = current_time + timedelta(days=realism.drawdown_pause_days)
+            drawdown_pause_triggered = True
     else:
         consecutive_losses = 0
+        weekly_consecutive_losses = 0
         cooldown_until = None
 
     stopped_for_day = (
         state.stopped_for_day
         or realized_loss_percent >= realism.max_daily_loss_percent
         or consecutive_losses >= realism.max_consecutive_losses
+        or drawdown_pause_triggered
+        or (
+            realism.weekly_loss_pause_count > 0
+            and weekly_consecutive_losses >= realism.weekly_loss_pause_count
+        )
     )
     return BacktestDailyRiskState(
         date=state.date,
         trades_today=trades_today,
         losses_today=losses_today,
         consecutive_losses=consecutive_losses,
+        weekly_consecutive_losses=weekly_consecutive_losses,
+        week_key=state.week_key,
         realized_loss_percent=realized_loss_percent,
         cooldown_until=cooldown_until,
         stopped_for_day=stopped_for_day,
+        peak_balance=peak_balance,
     )
+
+
+def _drawdown_percent(peak_balance: float, current_balance: float) -> float:
+    if peak_balance <= 0:
+        return 0.0
+    return max(0.0, (peak_balance - current_balance) / peak_balance * 100.0)
+
+
+def _week_key(current_time: datetime) -> str:
+    iso_year, iso_week, _ = current_time.isocalendar()
+    return f"{iso_year}-W{iso_week:02d}"
 
 
 def backtest_risk_skip_decision(

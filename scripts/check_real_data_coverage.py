@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -91,6 +92,19 @@ def _coverage_for_path(timeframe: str, path: Path) -> CoverageRow:
 def _read_timestamps(path: Path) -> list[datetime]:
     if not path.exists():
         return []
+
+    for _ in range(10):
+        before = path.stat()
+        timestamps = _read_timestamps_once(path)
+        after = path.stat()
+        if before.st_size == after.st_size and before.st_mtime_ns == after.st_mtime_ns:
+            return timestamps
+        time.sleep(0.5)
+
+    raise RuntimeError(f"CSV file is still changing while reading: {path}")
+
+
+def _read_timestamps_once(path: Path) -> list[datetime]:
     timestamps: list[datetime] = []
     with path.open("r", encoding="utf-8", newline="") as file:
         for row in csv.DictReader(file):

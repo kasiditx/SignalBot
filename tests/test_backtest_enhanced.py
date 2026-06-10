@@ -846,6 +846,15 @@ class BacktestEnhancedTest(unittest.TestCase):
 
         self.assertIsNone(candidate.tp1)
 
+    def test_candidate_h4_retest_uses_aggressive_breakeven_trigger_as_tp1(self) -> None:
+        candidate = backtest_candidate_from_signal(
+            _signal(SignalAction.BUY, strategy_name="H4 Zone Breakout Retest XAUUSD"),
+            _decision(),
+            signal_index=5,
+        )
+
+        self.assertEqual(candidate.tp1, 100.6)
+
     def test_candidate_uses_signal_level_risk_reward(self) -> None:
         candidate = backtest_candidate_from_signal(_signal(SignalAction.BUY, risk_reward=2.0), _decision(), signal_index=5)
 
@@ -934,6 +943,21 @@ class BacktestEnhancedTest(unittest.TestCase):
 
         self.assertEqual(trade.result, "OPEN_AT_END")
         self.assertEqual(trade.tp2, 102.0)
+
+    def test_simulation_moves_to_breakeven_when_tp1_then_entry_hit(self) -> None:
+        candidate = _candidate(SignalAction.BUY, tp1=100.6, tp2=102.0)
+
+        trade = simulate_enhanced_trade(
+            candidate,
+            [
+                _price_candle(0, 100, 100.5, 99.5, 100),
+                _price_candle(1, 100, 100.8, 100.1, 100.7),
+                _price_candle(2, 101, 101.1, 100.0, 100.2),
+            ],
+        )
+
+        self.assertEqual(trade.result, "BREAKEVEN")
+        self.assertEqual(trade.r_multiple, 0.0)
 
     def test_simulation_uses_tp1_when_tp2_missing(self) -> None:
         candidate = _candidate(SignalAction.BUY, tp1=101.0, tp2=None)
@@ -1284,6 +1308,8 @@ class BacktestEnhancedTest(unittest.TestCase):
         self.assertEqual(realism.max_daily_loss_percent, 3.0)
         self.assertEqual(realism.max_consecutive_losses, 3)
         self.assertEqual(realism.cooldown_minutes, 30)
+        self.assertEqual(realism.weekly_loss_pause_count, 0)
+        self.assertEqual(realism.weekly_loss_pause_days, 0)
 
     def test_creates_backtest_daily_risk_state_with_all_fields(self) -> None:
         cooldown_until = _dt(8)
@@ -1846,6 +1872,66 @@ class BacktestEnhancedTest(unittest.TestCase):
         result = update_backtest_daily_risk_state_after_trade(_daily_state(realized_loss_percent=2.5), _risk_trade("LOSS", -50.0), _dt(7), _realism_config())
 
         self.assertTrue(result.stopped_for_day)
+
+    def test_update_daily_risk_drawdown_pause_sets_multi_day_cooldown(self) -> None:
+        result = update_backtest_daily_risk_state_after_trade(
+            _daily_state(),
+            _risk_trade("LOSS", -500.0),
+            _dt(7),
+            _realism_config(drawdown_pause_percent=5.0, drawdown_pause_days=7),
+        )
+
+        self.assertEqual(result.cooldown_until, _dt(7) + timedelta(days=7))
+        self.assertTrue(result.stopped_for_day)
+
+    def test_new_day_reset_preserves_active_drawdown_pause(self) -> None:
+        state = _daily_state(cooldown_until=_dt(7) + timedelta(days=7), stopped_for_day=True, peak_balance=12000.0)
+
+        result = reset_daily_risk_state_if_new_day(state, _dt(7) + timedelta(days=1))
+
+        self.assertEqual(result.cooldown_until, _dt(7) + timedelta(days=7))
+        self.assertTrue(result.stopped_for_day)
+        self.assertEqual(result.peak_balance, 12000.0)
+
+    def test_update_daily_risk_drawdown_pause_uses_peak_balance(self) -> None:
+        result = update_backtest_daily_risk_state_after_trade(
+            _daily_state(peak_balance=12000.0),
+            _risk_trade_with_balance("LOSS", pnl=-100.0, balance_after=11200.0),
+            _dt(7),
+            _realism_config(drawdown_pause_percent=5.0, drawdown_pause_days=7),
+        )
+
+        self.assertEqual(result.cooldown_until, _dt(7) + timedelta(days=7))
+        self.assertTrue(result.stopped_for_day)
+        self.assertEqual(result.peak_balance, 12000.0)
+
+    def test_update_daily_risk_weekly_loss_pause_sets_multi_day_cooldown(self) -> None:
+        result = update_backtest_daily_risk_state_after_trade(
+            _daily_state(weekly_consecutive_losses=1),
+            _risk_trade("LOSS", -5.0),
+            _dt(7),
+            _realism_config(weekly_loss_pause_count=2, weekly_loss_pause_days=7),
+        )
+
+        self.assertEqual(result.weekly_consecutive_losses, 2)
+        self.assertEqual(result.cooldown_until, _dt(7) + timedelta(days=7))
+        self.assertTrue(result.stopped_for_day)
+
+    def test_new_day_reset_preserves_weekly_loss_count_in_same_week(self) -> None:
+        state = _daily_state(weekly_consecutive_losses=1, week_key="2026-W21")
+
+        result = reset_daily_risk_state_if_new_day(state, _dt(7) + timedelta(days=1))
+
+        self.assertEqual(result.weekly_consecutive_losses, 1)
+        self.assertEqual(result.week_key, "2026-W21")
+
+    def test_new_week_reset_clears_weekly_loss_count(self) -> None:
+        state = _daily_state(weekly_consecutive_losses=1, week_key="2026-W21")
+
+        result = reset_daily_risk_state_if_new_day(state, datetime(2026, 5, 25, tzinfo=UTC))
+
+        self.assertEqual(result.weekly_consecutive_losses, 0)
+        self.assertEqual(result.week_key, "2026-W22")
 
     def test_update_daily_risk_consecutive_loss_limit_stops_for_day(self) -> None:
         result = update_backtest_daily_risk_state_after_trade(_daily_state(consecutive_losses=2), _risk_trade("LOSS", -50.0), _dt(7), _realism_config())
@@ -2476,6 +2562,15 @@ def _risk_trade(
     result: str,
     pnl: float | None,
 ) -> BacktestTradeResult:
+    balance_after = 10000.0 + pnl if pnl is not None else None
+    return _risk_trade_with_balance(result, pnl, balance_after)
+
+
+def _risk_trade_with_balance(
+    result: str,
+    pnl: float | None,
+    balance_after: float | None,
+) -> BacktestTradeResult:
     return BacktestTradeResult(
         action=SignalAction.BUY,
         session="London",
@@ -2490,7 +2585,7 @@ def _risk_trade(
         risk_reward=1.5,
         volume=1.0,
         pnl=pnl,
-        balance_after=10000.0 + pnl if pnl is not None else None,
+        balance_after=balance_after,
         loss_reason="stop_loss_hit" if result.startswith("LOSS") else None,
         reject_reasons_before_entry=(),
     )
@@ -2501,18 +2596,24 @@ def _daily_state(
     trades_today: int = 0,
     losses_today: int = 0,
     consecutive_losses: int = 0,
+    weekly_consecutive_losses: int = 0,
+    week_key: str = "2026-W21",
     realized_loss_percent: float = 0.0,
     cooldown_until: datetime | None = None,
     stopped_for_day: bool = False,
+    peak_balance: float = 0.0,
 ) -> BacktestDailyRiskState:
     return BacktestDailyRiskState(
         date=date,
         trades_today=trades_today,
         losses_today=losses_today,
         consecutive_losses=consecutive_losses,
+        weekly_consecutive_losses=weekly_consecutive_losses,
+        week_key=week_key,
         realized_loss_percent=realized_loss_percent,
         cooldown_until=cooldown_until,
         stopped_for_day=stopped_for_day,
+        peak_balance=peak_balance,
     )
 
 
@@ -2649,6 +2750,10 @@ def _realism_config(
     max_daily_loss_percent: float = 3.0,
     max_consecutive_losses: int = 3,
     cooldown_minutes: int = 30,
+    drawdown_pause_percent: float = 0.0,
+    drawdown_pause_days: int = 0,
+    weekly_loss_pause_count: int = 0,
+    weekly_loss_pause_days: int = 0,
 ) -> BacktestRealismConfig:
     return BacktestRealismConfig(
         initial_balance=initial_balance,
@@ -2665,6 +2770,10 @@ def _realism_config(
         max_daily_loss_percent=max_daily_loss_percent,
         max_consecutive_losses=max_consecutive_losses,
         cooldown_minutes=cooldown_minutes,
+        drawdown_pause_percent=drawdown_pause_percent,
+        drawdown_pause_days=drawdown_pause_days,
+        weekly_loss_pause_count=weekly_loss_pause_count,
+        weekly_loss_pause_days=weekly_loss_pause_days,
     )
 
 
@@ -2749,12 +2858,13 @@ def _signal(
     take_profit: float | None = 101.5,
     risk_reward: float | None = 1.5,
     no_trade_reason: str = "wait for confirmation",
+    strategy_name: str = "test",
 ) -> Signal:
     return Signal(
         action=action,
         symbol="XAUUSD",
         timeframe="M1",
-        strategy_name="test",
+        strategy_name=strategy_name,
         market_structure="Uptrend",
         setup_type="NEAR_DEMAND",
         trend_summary="BULLISH",

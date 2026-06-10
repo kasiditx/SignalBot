@@ -11,14 +11,22 @@
 input string InpOrderFile       = "trading_signal_order.csv";
 input bool   InpDryRun          = false;
 input int    InpIntervalSeconds = 1;
-input int    InpMaxSpreadPoints = 500;
+input int    InpMaxSpreadPoints = 300;
 input int    InpDeviationPoints = 50;
 input int    InpMaxPositions    = 1;
 input long   InpMagicNumber     = 20260515;
 input bool   InpDeleteOrderFileAfterProcessing = true;
+input double InpMaxActualRiskPercent = 25.0;
+input bool   InpEnableBreakEven = true;
+input double InpBreakEvenTriggerR = 0.6;
+input int    InpBreakEvenOffsetPoints = 0;
+input bool   InpEnablePartialClose = false;
+input double InpPartialCloseTriggerR = 1.0;
+input double InpPartialClosePercent = 50.0;
 
 CTrade trade;
 string last_nonce = "";
+const int ORDER_FIELD_COUNT = 11;
 
 struct OrderIntent
 {
@@ -31,6 +39,7 @@ struct OrderIntent
    double take_profit;
    long magic_number;
    string comment;
+   double actual_risk_percent;
 };
 
 int OnInit()
@@ -43,6 +52,21 @@ int OnInit()
    if(InpMaxPositions < 0)
    {
       Print("InpMaxPositions must be zero or greater");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpBreakEvenTriggerR <= 0)
+   {
+      Print("InpBreakEvenTriggerR must be greater than zero");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpPartialCloseTriggerR <= 0)
+   {
+      Print("InpPartialCloseTriggerR must be greater than zero");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpPartialClosePercent <= 0 || InpPartialClosePercent >= 100)
+   {
+      Print("InpPartialClosePercent must be greater than zero and lower than 100");
       return INIT_PARAMETERS_INCORRECT;
    }
 
@@ -66,6 +90,8 @@ void OnTick()
 
 void OnTimer()
 {
+   ManageOpenPositions();
+
    OrderIntent intent;
    if(!ReadOrderIntent(intent))
       return;
@@ -96,7 +122,7 @@ bool ReadOrderIntent(OrderIntent &intent)
       return false;
 
    // Header row.
-   for(int column = 0; column < 10 && !FileIsEnding(handle); column++)
+   for(int column = 0; column < ORDER_FIELD_COUNT && !FileIsEnding(handle); column++)
       FileReadString(handle);
 
    if(FileIsEnding(handle))
@@ -115,6 +141,7 @@ bool ReadOrderIntent(OrderIntent &intent)
    intent.take_profit = StringToDouble(FileReadString(handle));
    intent.magic_number = (long)StringToInteger(FileReadString(handle));
    intent.comment = FileReadString(handle);
+   intent.actual_risk_percent = StringToDouble(FileReadString(handle));
 
    FileClose(handle);
    return intent.nonce != "";
@@ -140,6 +167,11 @@ bool ValidateIntent(const OrderIntent &intent)
    if(intent.volume <= 0 || intent.stop_loss <= 0 || intent.take_profit <= 0)
    {
       Print("Invalid order levels or volume. Volume=", intent.volume, " SL=", intent.stop_loss, " TP=", intent.take_profit);
+      return false;
+   }
+   if(InpMaxActualRiskPercent > 0 && intent.actual_risk_percent > InpMaxActualRiskPercent)
+   {
+      Print("Actual risk too high. Risk=", intent.actual_risk_percent, "% Max=", InpMaxActualRiskPercent, "%");
       return false;
    }
    if(intent.action == "BUY" && !(intent.stop_loss < intent.entry && intent.entry < intent.take_profit))
@@ -227,6 +259,111 @@ int CountOpenPositions()
       count++;
    }
    return count;
+}
+
+void ManageOpenPositions()
+{
+   for(int index = PositionsTotal() - 1; index >= 0; index--)
+   {
+      ulong ticket = PositionGetTicket(index);
+      if(ticket == 0)
+         continue;
+      if(!PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
+
+      ManagePosition(ticket);
+   }
+}
+
+void ManagePosition(const ulong ticket)
+{
+   long position_type = PositionGetInteger(POSITION_TYPE);
+   double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+   double stop_loss = PositionGetDouble(POSITION_SL);
+   double take_profit = PositionGetDouble(POSITION_TP);
+   double volume = PositionGetDouble(POSITION_VOLUME);
+   if(open_price <= 0 || stop_loss <= 0 || volume <= 0)
+      return;
+
+   double risk_distance = MathAbs(open_price - stop_loss);
+   if(risk_distance <= 0)
+      return;
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double current_price = position_type == POSITION_TYPE_BUY ? bid : ask;
+   if(current_price <= 0)
+      return;
+
+   double profit_distance = position_type == POSITION_TYPE_BUY ? current_price - open_price : open_price - current_price;
+   if(profit_distance <= 0)
+      return;
+
+   if(InpEnableBreakEven && profit_distance >= risk_distance * InpBreakEvenTriggerR)
+      MoveStopToBreakEven(ticket, position_type, stop_loss, take_profit, open_price);
+}
+
+bool IsStopAtBreakEven(const long position_type, const double stop_loss, const double open_price)
+{
+   if(position_type == POSITION_TYPE_BUY)
+      return stop_loss >= open_price;
+   return stop_loss <= open_price;
+}
+
+void TryPartialClose(const ulong ticket, const double current_volume)
+{
+   double min_volume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double close_volume = NormalizeVolumeForPartial(current_volume * (InpPartialClosePercent / 100.0));
+   if(close_volume < min_volume)
+      return;
+   if(current_volume - close_volume < min_volume)
+      return;
+
+   if(!trade.PositionClosePartial(ticket, close_volume))
+   {
+      Print("Partial close failed. Ticket=", ticket, " Volume=", close_volume,
+            " Retcode=", trade.ResultRetcode(), " Description=", trade.ResultRetcodeDescription());
+      return;
+   }
+
+   Print("Partial close placed. Ticket=", ticket, " Volume=", close_volume);
+}
+
+void MoveStopToBreakEven(
+   const ulong ticket,
+   const long position_type,
+   const double current_stop_loss,
+   const double take_profit,
+   const double open_price
+)
+{
+   double offset = InpBreakEvenOffsetPoints * _Point;
+   double break_even_stop = position_type == POSITION_TYPE_BUY ? open_price + offset : open_price - offset;
+   if(position_type == POSITION_TYPE_BUY && current_stop_loss >= break_even_stop)
+      return;
+   if(position_type == POSITION_TYPE_SELL && current_stop_loss <= break_even_stop)
+      return;
+
+   if(!trade.PositionModify(ticket, NormalizeDouble(break_even_stop, _Digits), take_profit))
+   {
+      Print("Breakeven modify failed. Ticket=", ticket, " SL=", break_even_stop,
+            " Retcode=", trade.ResultRetcode(), " Description=", trade.ResultRetcodeDescription());
+      return;
+   }
+
+   Print("Stop moved to breakeven. Ticket=", ticket, " SL=", break_even_stop);
+}
+
+double NormalizeVolumeForPartial(const double requested_volume)
+{
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0)
+      return 0.0;
+   return NormalizeDouble(MathFloor(requested_volume / step) * step, 3);
 }
 
 double NormalizeVolume(const double requested_volume)

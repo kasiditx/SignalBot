@@ -91,12 +91,11 @@ Pro MTF Price Action Structure
 - ใช้ EMA, RSI และ ATR เป็น confirmation/risk context ไม่ใช่ blind signal
 - ใช้ price-action edge จากคู่มือกราฟเปล่า เช่น clean traffic, wick fill, force flip/engulfing, rejection และ Fibonacci context ก่อนยอมรับ breakout
 - body breakout ขั้นต่ำตั้งค่าได้ผ่าน `SIGNAL_BODY_BREAK_ATR_RATIO` ค่า default ปัจจุบันคือ `0.20`
-- ใช้ `M5` เป็น execution timeframe แล้วกรองด้วย `D1/H4/H1/M30/M15` ก่อนปล่อยสัญญาณ
+- ใช้ `M5` หรือ `M15` เป็น execution timeframe แล้วกรองด้วย `D1/H4/H1/M30/M15` ก่อนปล่อยสัญญาณ
 - `30M` และ `15M` ต้องไปทางเดียวกับสัญญาณทั้งคู่ เพื่อลด breakout ที่ยังไม่มีแรงหนุนระยะกลาง
 - `1D/4H/1H` ต้องไม่มี timeframe ที่สวนทางกับสัญญาณ ถ้ามีฝั่งตรงข้ามปนอยู่ให้ `WAIT`
 - Stop Loss ใช้ wick protection บริเวณปลายไส้เทียนก่อนหน้า
-- Risk/Reward ตั้งค่าผ่าน `SIGNAL_RISK_REWARD` ค่า default ปัจจุบันคือ `0.7` เพื่อให้ backtest ล่าสุดเข้าใกล้ win rate มากกว่า 70%
-- หมายเหตุ: `0.7R` คือ TP สั้นกว่า SL จึงต้องติดตาม Profit Factor, drawdown และ slippage ใกล้ชิดกว่าระบบที่ใช้ RR มากกว่า 1
+- Risk/Reward ตั้งค่าผ่าน `SIGNAL_RISK_REWARD` ค่า default ปัจจุบันคือ `2.0` สำหรับ session breakout/retest ที่ต้องการให้กำไรเฉลี่ยชนะขาดทุนเฉลี่ย
 - ถ้าโครงสร้างยัง sideways/mixed ให้ `WAIT`
 
 เงื่อนไข `BUY`:
@@ -208,8 +207,8 @@ TRADINGVIEW_WEBHOOK_DRY_RUN=true
 
 ```text
 MT5_SYMBOL=XAUUSD
-MT5_TIMEFRAME=H1
-MT5_BARS=300
+MT5_TIMEFRAME=M5
+MT5_BARS=120000
 MT5_OUTPUT_CSV=data/mt5_ohlcv.csv
 SIGNAL_CSV_PATH=data/mt5_ohlcv.csv
 ```
@@ -222,9 +221,28 @@ SIGNAL_CSV_PATH=data/mt5_ohlcv.csv
 4. ถ้าเคยลาก EA ตัวเก่าไว้แล้ว ให้ลบ EA ออกจาก chart ก่อน แล้วลากตัวใหม่ใส่ chart อีกครั้ง
 5. กลับไป MT5 แล้วลาก EA ไปใส่ chart ที่ต้องการ เช่น XAUUSD M5
 6. ตั้งค่า:
-   - `InpBars`: อย่างน้อย 300
+   - `InpHistoryMonths`: `13` เพื่อให้มีข้อมูลพอสำหรับ backtest 12 เดือนแบบ month-to-current
+   - `InpBarsD1`: อย่างน้อย `800`
+   - `InpBarsH4`: อย่างน้อย `5000`
+   - `InpBarsH1`: อย่างน้อย `20000`
+   - `InpBarsM30`: อย่างน้อย `40000`
+   - `InpBarsM15`: อย่างน้อย `80000`
+   - `InpBarsM5`: อย่างน้อย `120000`
    - `InpIntervalSeconds`: เช่น 5
    - `InpExportD1/H4/H1/M30/M15/M5`: `true`
+
+ถ้า coverage ยังขึ้นว่า `ไม่พอ` แปลว่า MT5/broker ยังไม่ได้โหลด history จริงย้อนหลังพอ ไม่ควรเติมข้อมูลเองหรือใช้ข้อมูลปลอม ให้ทำตามนี้ก่อน:
+
+1. ไปที่ MT5 `Tools > Options > Charts`
+2. ตั้ง `Max bars in chart` และ `Max bars in history` ให้สูง เช่น `500000`
+3. เปิดกราฟ symbol เดียวกับ `.env` เช่น `XAUUSD.iux`
+4. เปิด timeframe `M5`, `M15`, `M30`, `H1`, `H4`, `D1` แล้ว scroll chart ย้อนหลัง หรือเปิด `History Center` เพื่อ download history จาก broker
+5. ลบ EA exporter ตัวเก่าออก แล้วลาก `TradingSignalCsvExporter` ที่ compile ใหม่เข้า chart อีกครั้ง
+6. รอให้ไฟล์ใน `MQL5/Files` ถูกเขียนใหม่ แล้วเช็ก coverage ด้วย:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/check_real_data_coverage.py
+```
 
 EA นี้ไม่ส่งคำสั่งซื้อขาย ทำหน้าที่ export CSV หลาย timeframe เท่านั้น:
 
@@ -379,6 +397,33 @@ AUTO_TRADE_ORDER_FILE=/Users/kasidit/Library/Application Support/net.metaquotes.
 5. ลาก EA `TradingSignalAutoTrader` ลงกราฟ `XAUUSD.iux` หรือ symbol เดียวกับ `.env`
 6. เริ่มจาก `InpDryRun=true` ก่อนเสมอ เพื่อให้ EA แค่ print ว่ารับคำสั่งได้ แต่ยังไม่ส่ง order จริง
 7. เมื่อทดสอบบน Demo แล้วเท่านั้น ค่อยพิจารณา `InpDryRun=false`
+
+สำหรับ `TradingSignalAutoTrader` รุ่นที่มี position management ให้ตั้งค่าเพิ่มเติม:
+
+```text
+InpEnableBreakEven=true
+InpBreakEvenTriggerR=0.6
+InpBreakEvenOffsetPoints=0
+InpEnablePartialClose=false
+InpPartialCloseTriggerR=1.0
+InpPartialClosePercent=50.0
+InpMaxSpreadPoints=300
+```
+
+หมายเหตุสำหรับบัญชี Standard ทุนเล็ก: ถ้า order volume เป็น `0.01` และ broker minimum volume คือ `0.01` ไม่ควรใช้ partial close เพราะปิดครึ่งหนึ่งแล้วต่ำกว่า minimum lot ระบบนี้จึงใช้ aggressive breakeven แทน โดยขยับ SL ไปหน้าทุนเมื่อราคาไปถูกทางประมาณ `0.6R` และให้ EA reject order ถ้า spread สูงกว่า `InpMaxSpreadPoints`
+
+ถ้าใช้ flow MT5 exporter + derived M15/M30 จาก M5 ให้รันตัวช่วยนี้จาก root repo:
+
+```bash
+./scripts/run_auto_trade_demo.sh
+```
+
+ตัวช่วยนี้จะทำ 4 อย่าง:
+
+1. ตรวจ `.env` ว่าเปิด `AUTO_TRADE_ENABLED=true`, `AUTO_TRADE_MODE=mt5_file`, และ `SIGNAL_TRADE_MODE` เป็น `asian_breakout` หรือ `h4_breakout_retest`
+2. สร้างไฟล์ `mt5_ohlcv_M15_from_M5.csv` และ `mt5_ohlcv_M30_from_M5.csv` จาก M5 จริง
+3. เช็ก coverage ข้อมูลจริง
+4. เปิด resampler แบบ watch แล้วรัน `trading_signal_bot.signal_poller`
 
 Risk sizing ปัจจุบันคำนวณแบบประมาณจาก:
 
